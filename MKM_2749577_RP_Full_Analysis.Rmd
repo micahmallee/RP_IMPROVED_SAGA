@@ -1,0 +1,1740 @@
+---
+title: "MKM_2749577_RP_Full_Analysis"
+author: "Micah Mallée"
+date: "2024-06-07"
+output: html_document
+---
+
+### Load packages
+```{r}
+library(limma)
+library(dplyr)
+library(sva)
+library(EnhancedVolcano)
+library(patchwork)
+library(ggpubr)
+library(reshape2)
+```
+
+### Read annotation and sample information
+```{r}
+# Read Annotation for all 39428 probes
+Annotation <- read.delim("~/SAGA_annotation/Annotation_SAGA_FINAL_20231212.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE, row.names = 1)
+
+# Read Annotation all 38387 annotated probes
+Annotation.known <- read.delim("~/SAGA_annotation/Annotation_SAGA_FINAL_KNOWN_20231212.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE, row.names = 1)
+
+# Read sample information for known unpublished samples
+pData_412 <- read.csv('/home/mmallee/pData_train_412.csv')
+pData_258 <- read.csv('/home/mmallee/pData_258.csv')
+
+# Set colors for plotting
+condition_colors <- c("A2_Mock" = "#737373", "A1_Mutagenic" = "#CB181D", "A3_Safe" = "#b2df8a", 'A4_Unknown' = '#623456')
+
+class_colors <- c("transforming" = "#CB181D", "untransforming" = "#b2df8a")
+
+ivim_colors <- c("Immortalizing" = "#CB181D", "Safe" = "#b2df8a")
+
+clone_colors <- c("Growth" = "#CB181D", "No_Growth" = "#b2df8a")
+```
+
+### Define functions
+```{r}
+# Creating design matrices per batch
+create_design <- function(pdata_obj) {
+  groups <- factor(pdata_obj$Design)
+  design <- model.matrix(~ 0 + groups)
+  rownames(design) <- pdata_obj$`Sample Number`
+  if (length(colnames(design)) == 3) {
+    colnames(design) <- c("transforming", "mock", "safe")
+  } else if (length(colnames(design)) == 1) {
+    colnames(design) <- c("transforming")
+  } else {
+    colnames(design) <- c("transforming", "safe")
+  }
+  return(design)
+}
+# Creating contrast matrices per batch
+
+create_contrasts <- function(designs_obj) {
+  if (length(designs_obj) == 3) {
+    contrast <- makeContrasts(
+      c1 = transforming - mock,
+      c2 = safe - mock,
+      c3 = transforming - (mock + safe) / 2,
+      c4 = transforming - safe,
+      levels = designs_obj
+    )
+  } else {
+    contrast <- makeContrasts(
+      c4 = transforming - safe,
+      levels = designs_obj
+    )
+  }
+  return(contrast)
+}
+
+GSA.read.gmt <- function(filename) {
+  #
+  ## Read in and parse a gmt file (gene set file) from the  Broad institute
+  # this is tricky, because each lines (geneset) has a variable length
+  #  I read the file twice, first to pick up the geneset name and description
+  # in the   first two  columns, then I read it all in as a long string
+
+  # The beginning and end of each gene set in the string
+  # is determined by matching
+  # BOTH on  geneset name and description (since geneset names sometimes
+  # occur as genenames elsewhere in the file)
+
+  a <- scan(filename, what = list("", ""), sep = "\t", quote = NULL, fill = T, flush = T, multi.line = F)
+  geneset.names <- a[1][[1]]
+
+  geneset.descriptions <- a[2][[1]]
+
+  dd <- scan(filename, what = "", sep = "\t", quote = NULL)
+
+
+  nn <- length(geneset.names)
+  n <- length(dd)
+  ox <- rep(NA, nn)
+
+  ii <- 1
+  for (i in 1:nn) {
+    cat(i)
+    while ((dd[ii] != geneset.names[i]) | (dd[ii + 1] != geneset.descriptions[i])) {
+      ii <- ii + 1
+    }
+    ox[i] <- ii
+    ii <- ii + 1
+  }
+
+  genesets <- vector("list", nn)
+
+  for (i in 1:(nn - 1)) {
+    cat(i, fill = T)
+    i1 <- ox[i] + 2
+    i2 <- ox[i + 1] - 1
+    geneset.descriptions[i] <- dd[ox[i] + 1]
+    genesets[[i]] <- dd[i1:i2]
+  }
+
+  geneset.descriptions[nn] <- dd[ox[nn] + 1]
+  genesets[[nn]] <- dd[(ox[nn] + 2):n]
+  out <- list(genesets = genesets, geneset.names = geneset.names, geneset.descriptions = geneset.descriptions)
+  class(out) <- "GSA.genesets"
+  return(out)
+}
+
+get_BC_eset <- function(pData) {
+  # Format as EListRaw
+  E <- raw_agilent[, pData$Sample_ID]
+  E <- new("EListRaw", list(E = E, genes = data.frame(ProbeName = raw_agilent$ProbeID), targets = colnames(E), source = 'agilent.median'))
+  
+  # Quantile normalization
+  eset.rma <- normalizeBetweenArrays(object = E, method = "quantile")
+  
+  # Average over quadruplicates
+  eset.rma <- avereps(x = eset.rma, ID = E$genes$ProbeName) 
+  
+  # Batch correct
+  # Export from EList to matrix
+  eset.rma_m <- eset.rma$E
+  
+  # Subset for 38,387 known probes:
+  eset.rma_m <- eset.rma_m[rownames(Annotation.known), ]
+  
+  batch <- pData$Batch
+  modcombat <- model.matrix(~1, data = pData)
+  eset.batch <- ComBat(dat = eset.rma_m, batch = batch, mod = modcombat, par.prior = TRUE, prior.plots = F)
+  return(eset.batch)
+}
+
+sigboxplot <- function(data, include_celltypes = NULL, split.by = NA, plot_title = 'Estimated cell type composition differences', subtitle = '', color = c(), combs = NULL) {
+  if (is.null(include_celltypes)) {
+    include_celltypes <- colnames(data)[2:11]
+  }
+  plotdata <- melt(data = data, id = c(colnames(data)[!colnames(data) %in% include_celltypes]))
+  ggplot(data = plotdata, aes(x = variable, y = value, fill = !! sym(split.by))) +
+  geom_boxplot(aes(fill = !! sym(split.by)), position = position_dodge())  +
+  scale_y_continuous(limits = c(0, 1)) + 
+  stat_compare_means(comparisons = combs, mapping = aes(group = !! sym(split.by)), label = "p.signif", label.y = 0.9, hide.ns = T, method = 'wilcox.test') + 
+  xlab(label = 'Cell type') + ylab(label = 'Proportion') + 
+  ggtitle(label = plot_title, subtitle = subtitle) +
+  theme_pubclean() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.key = element_rect(fill = 'NA')) + scale_fill_manual(values = color)
+}
+
+barplot.seurat <- function(obj, id1, id2){
+
+    df.plot <- obj@meta.data %>% 
+    group_by(.[[id1]]) %>%
+    count(.[[id2]]) %>%
+    mutate(Perc = n / sum(n) * 100) 
+
+    colnames(df.plot)[1:2] <- c(id1, id2)
+
+    ggplot(df.plot, aes_string(id1, "Perc", fill = id2)) + 
+    geom_bar(stat = "Identity") + ylab("Percentage of cells") +
+    guides(x = guide_axis(angle = 90)) + theme_minimal() 
+}
+```
+
+### Read raw microarrays
+```{r}
+# Redo this, read in per Agilent-ID, select and order probes per agilent-ID. Only published data
+agilent_platforms <- unique(pData_412$agilent_id)
+path_published <- '//vf-DataSafe/DataSafe$/Div0/ict/optimized_SAGA_2457/GSE109391_RAW'
+elists <- c()
+for (platform in agilent_platforms) {
+  pData <- pData_412[pData_412$agilent_id == platform & pData_412$Protocol == 'published', ]
+  files <- pData$Filename
+  raw_published <- read.maimages(path = path_published, files = files, source = "agilent.median", green.only = T, 
+                                 columns = list(G = "gMedianSignal"), annotation = c("ProbeName"))
+  
+  colnames(raw_published) <- pData$Sample_ID
+  # Subset for 39428 probes from Agilent ID026655
+  index <- raw_published$genes$ProbeName %in% row.names(Annotation)
+  raw_published <- raw_published[index, ]
+  raw_published <- raw_published[order(raw_published$genes$ProbeName), ]
+  elists <- append(elists, list(raw_published))
+}
+
+# New data
+pData <- pData_412[!pData_412$Protocol == 'published', ]
+files <- pData$Filename
+path_new <- '//vf-DataSafe/DataSafe$/Div0/ict/optimized_SAGA_2457/SAGA_RAW/SAGA_RAW'
+raw_published <- read.maimages(path = path_new, files = files, source = "agilent.median", green.only = T, 
+                               columns = list(G = "gMedianSignal"), annotation = c("ProbeName"))
+
+colnames(raw_published) <- pData$Sample_ID
+# Subset for 39428 probes from Agilent ID026655
+index <- raw_published$genes$ProbeName %in% row.names(Annotation)
+raw_published <- raw_published[index, ]
+raw_published <- raw_published[order(raw_published$genes$ProbeName), ]
+elists <- append(elists, list(raw_published))
+
+# Combine datasets
+SAGA_RAW <- cbind.EList(elists[[1]], elists[[2]], elists[[3]], elists[[4]], elists[[5]], elists[[6]], elists[[7]])
+
+# Export quadruplicates
+SAGA_matrix <- data.frame(ProbeID = SAGA_RAW$genes$ProbeName, SAGA_RAW$E)
+write.table(SAGA_matrix, file = "RAW_FullSagaSet412_quadruplicates_FINAL.txt", sep = "\t", row.names = TRUE, col.names = NA)
+```
+
+
+### Read quads and normalize and average 
+```{r}
+# Read quads
+raw_agilent <- read.table('/exports/immu-staallab/Micah/RAW_FullSagaSet700_quadruplicates_FINAL.txt', sep = '\t', header = T)[, -1]
+
+# Write data
+write.table(eset.batch, file = "/exports/immu-staallab/Micah/ESET_RMA_COMBAT_FullSagaSet412_FINAL.txt", sep = "\t", row.names = TRUE, col.names = NA)
+
+# How to read the data again
+eset.batch <- read.table("/exports/immu-staallab/Micah/ESET_RMA_COMBAT_FullSagaSet412_FINAL.txt", sep = "\t", row.names = 1, header = T)
+```
+
+
+### Quantile normalization and averaging over quadruplicates
+```{r}
+# Quantile normalization
+eset.rma <- normalizeBetweenArrays(object = raw_agilent, method = "quantile")
+
+# Average over quadruplicates
+eset.rma <- avereps(x = eset.rma, ID = eset.rma$genes$ProbeName)
+```
+
+
+### Batch correction using ComBat
+```{r}
+# Export from EList to matrix
+eset.rma_m <- eset.rma$E
+
+# Subset for 38,387 known probes:
+eset.rma_m <- eset.rma_m[rownames(Annotation.known), ]
+
+batch <- pData_final$Batch
+modcombat <- model.matrix(~1, data = pData_final)
+eset.batch <- ComBat(dat = eset.rma_m, batch = batch, mod = modcombat, par.prior = TRUE, prior.plots = F)
+write.table(eset.batch, file = "/exports/immu-staallab/Micah/ESET_RMA_COMBAT_FullSagaSet412_FINAL.txt", sep = "\t", row.names = TRUE, col.names = NA)
+
+# How to read data again
+eset.batch <- read.table("/exports/immu-staallab/Micah/ESET_RMA_COMBAT_FullSagaSet700_FINAL.txt", sep = "\t", row.names = 1, header = T)
+```
+
+### Export final dataset
+```{r}
+# Export from EList to matrix
+eset.rma_m <- eset.rma$E
+
+# Subset for 38,387 known probes:
+eset.rma_m <- eset.rma_m[rownames(Annotation.known), ]
+
+# Export to csv file
+write.csv(eset.rma_m, file = "/exports/immu-staallab/Micah/ESET_RMA_Final_258.txt")
+
+# How to read data again
+eset.rma <- read.csv(file = "/exports/immu-staallab/Micah/ESET_RMA_Final_258.txt", row.names = 1)
+```
+
+
+### Create mixture file for deconvolution
+```{r}
+# Export from EList to matrix
+eset.rma_m <- eset.rma$E
+
+# Subset for 38,387 known probes:
+eset.rma_m <- eset.rma_m[rownames(Annotation.known), ]
+
+# Select one probe for each gene (select probe with highest variation)
+eset <- data.frame(eset.rma_m, GeneSymbol = Annotation.known$GeneSymbol_FINAL)
+eset.sd <- apply(eset[1:length(eset) - 1], 1, sd)
+eset.sd.order <- eset[order(eset.sd, decreasing = T), ]
+
+# Add GeneSymbol column
+eset.filter <- subset(eset.sd.order, !duplicated(eset.sd.order$GeneSymbol))
+eset.filter <- relocate(eset.filter, "GeneSymbol")
+eset.filter$GeneSymbol <- toupper(eset.filter$GeneSymbol)
+
+# Export to file
+write.table(eset.filter, "/exports/immu-staallab/Micah/mixture_batch_412_final.txt", quote = F, sep = "\t", row.names = F)
+```
+
+
+
+
+### t-SNE to show difference in transforming cultures
+```{r}
+library(Rtsne)
+
+set.seed(37)
+tsne_out <- Rtsne(t(eset.rma), dims = 2, perplexity = 16, theta = 0.5, pca = FALSE, max_iter = 1000, verbose = FALSE, is_distance = FALSE, check_duplicates = FALSE)
+set.seed(37)
+tsne_out_BC <- Rtsne(t(eset.batch), dims = 2, perplexity = 16, theta = 0.5, pca = FALSE, max_iter = 1000, verbose = FALSE, is_distance = FALSE, check_duplicates = FALSE)
+
+set.seed(37)
+tsne_out_BC <- Rtsne(t(predictors_batch), dims = 2, perplexity = 16, theta = 0.5, pca = FALSE, max_iter = 1000, verbose = FALSE, is_distance = FALSE, check_duplicates = FALSE)
+
+set.seed(37)
+tsne_out_BC <- Rtsne(matrix.unknown, dims = 2, perplexity = 1, theta = 0.5, pca = FALSE, max_iter = 1000, verbose = FALSE, is_distance = FALSE, check_duplicates = FALSE)
+tsne_plot_BC <- data.frame(x = tsne_out_BC$Y[, 1], y = tsne_out_BC$Y[, 2])
+tsne_plot_BC <- bind_cols(tsne_plot_BC, pData_test, predict = Prediction_SVM.Caret$Prediction.SVM.Caret)
+
+
+tsne_plot <- data.frame(x = tsne_out$Y[, 1], y = tsne_out$Y[, 2])
+tsne_plot <- bind_cols(tsne_plot, pData_final)
+
+tsne_plot_BC <- data.frame(x = tsne_out_BC$Y[, 1], y = tsne_out_BC$Y[, 2])
+tsne_plot_BC <- bind_cols(tsne_plot_BC, pData_final)
+
+tsnes <- lapply(c("Batch", "clonal_evidence", "IVIM", "Class"), function(x) {
+  p <- ggplot(tsne_plot) +
+    geom_point(aes_string(x = "x", y = "y", color = x)) +
+    ggpubr::theme_pubclean() +
+    ggtitle(label = paste0(x)) +
+    theme(legend.position = "right", legend.key = element_rect(fill = NA))
+  if (x == 'clonal_evidence') {
+    p <- p + scale_color_manual(values = clone_colors)
+  }
+  if (x == 'IVIM') {
+    p <- p + scale_color_manual(values = ivim_colors)
+  }
+  if (x == 'Class') {
+    p <- p + scale_color_manual(values = class_colors)
+  }
+  return(p)
+})
+
+wrap_plots(tsnes)
+
+tsnes_bc <- lapply(c("Vector", "predict", "IVIM", "Design"), function(x) {
+  p <- ggplot(tsne_plot_BC) +
+    geom_point(aes_string(x = "x", y = "y", color = x)) +
+    ggpubr::theme_pubclean() +
+    ggtitle(label = paste0(x)) +
+    theme(legend.position = "right", legend.key = element_rect(fill = NA))
+  if (x == 'clonal_evidence') {
+    p <- p + scale_color_manual(values = clone_colors)
+  }
+  if (x == 'IVIM') {
+    p <- p + scale_color_manual(values = ivim_colors)
+  }
+  if (x == 'Class') {
+    p <- p + scale_color_manual(values = class_colors)
+  }
+  if (x == 'Design') {
+    p <- p + scale_color_manual(values = condition_colors)
+  }
+  return(p)
+})
+
+wrap_plots(tsnes_bc)
+```
+
+### PCA
+```{r}
+# Run PCA
+pca <- prcomp(t(eset.rma$E))
+pca <- prcomp(t(eset.batch))
+pca <- prcomp(t(matrix.gsea))
+# PCA on one batch
+pca <- prcomp(t(eset.batch[, pData_model$Sample_ID[pData_model$Batch == 51],]))
+
+# PCA testdata
+pca <- prcomp(matrix.unknown)
+pca_df <- data.frame(x = pca$x[, 1], y = pca$x[, 2]) %>% bind_cols(., pData_test)
+pca_df$predict <- Prediction_SVM.Caret$Prediction.SVM.Caret
+
+# PCA on predictors
+predictors_batch <- eset.batch[GA.FINAL[['ga']][['final']]]
+
+predictors_batch <- predictors_batch[!rownames(predictors_batch) == 'NA',]
+
+pca <- prcomp(t(predictors_batch))
+
+# Format results for plotting
+pca_summary <- summary(pca)
+pca_df <- data.frame(x = pca$x[, 1], y = pca$x[, 2]) %>% bind_cols(., pData_final)
+pca_df <- data.frame(x = pca$x[, 1], y = pca$x[, 2]) %>% bind_cols(., pData_model)
+pca_df <- data.frame(x = pca$x[, 1], y = pca$x[, 2]) %>% bind_cols(., pData_model[pData_model$Batch == 51, ])
+
+# Single PC plot
+ggplot(data = pca_df, aes_string("x", "y", col = "Design")) +
+  geom_point() +
+  ggpubr::theme_pubclean() +
+  ggtitle(label = paste0("Design")) +
+  theme(legend.position = "right", legend.key = element_rect(fill = NA)) + scale_color_manual(values = condition_colors) + xlab(label = paste0("Explained Variance (", round(pca_summary$importance[2, 1] * 100, 1), "%)")) + ylab(label = paste0("Explained Variance (", round(pca_summary$importance[2, 2] * 100, 1), "%)"))
+
+# Create multiple PC plots colored by different properties
+pcas <- lapply(c("Batch", "agilent_id", "IVIM", "Class"), function(x) {
+  p <- ggplot(data = pca_df, aes_string("x", "y", col = x)) +
+    geom_point() +
+    ggpubr::theme_pubclean() +
+    ggtitle(label = paste0(x)) +
+    theme(legend.position = "right", legend.key = element_rect(fill = NA))
+  if (x == 'clonal_evidence') {
+    p <- p + scale_color_manual(values = clone_colors)
+  }
+  if (x == 'IVIM') {
+    p <- p + scale_color_manual(values = ivim_colors)
+  }
+  if (x == 'Class') {
+    p <- p + scale_color_manual(values = class_colors)
+  }
+  return(p)
+})
+
+# Wrap plots
+wrap_plots(pcas) & xlab(label = paste0("Explained Variance (", round(pca_summary$importance[2, 1] * 100, 1), "%)")) & ylab(label = paste0("Explained Variance (", round(pca_summary$importance[2, 2] * 100, 1), "%)"))
+```
+
+
+### Find differentially expressed genes between samples - LIMMA
+```{r}
+setwd(dir = "~/SAGA_GEX_Analysis/saga258/")
+# Create design matrix
+targets_152 <- read.table('SAGA_GEX_Analysis/Published_data/SAGA_Targets_FINAL_152.txt', header = T, row.names = 1)
+
+pData_412 <- read.csv('/home/mmallee/pData_train_412.csv')
+
+pData <- pData_152
+pData <- targets_152
+pData <- pData_154
+pData <- pData_258
+pData <- pData_412
+groups <- factor(pData$Design)
+design <- model.matrix(~ 0 + groups)
+rownames(design) <- pData$Sample
+colnames(design) <- c("Mutagenic", "Mock", "Safe")
+
+# Create contrast matrix
+cont.matrix <- makeContrasts(
+  c1 = Mutagenic - Mock,
+  c2 = Safe - Mock,
+  c3 = Mutagenic - (Mock + Safe) / 2,
+  c4 = Mutagenic - Safe,
+  levels = design
+)
+
+# Fit model and compute estimated coefficients and standard errors
+fit <- lmFit(eset_258, design)
+fit <- lmFit(eset_154, design)
+fit <- lmFit(eset.batch, design)
+fit <- lmFit(ok_152, design)
+fit <- lmFit(eset_412, design)
+fit <- contrasts.fit(fit, contrasts = cont.matrix)
+fit2 <- eBayes(fit)
+
+
+# Analyze results
+## Output: Supplementary Data 2
+library(writexl)
+# Supplementary Data 2 tab 1
+topMvMoS <- topTable(fit2, coef = 3, n = Inf, adjust.method = "BH", sort.by = "logFC")
+topMvMoS <- cbind(topMvMoS, Annotation.known[row.names(topMvMoS), ])
+write.table(topMvMoS, file = "/home/mmallee/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Mutagenic_vs_Mock_and_Safe_FINAL_batch.txt", sep = "\t", col.names = NA)
+
+# Supplementary Data 2 tab 3: transforming - mock
+topMvMo <- topTable(fit2, coef = 1, n = Inf, adjust.method = "BH", sort.by = "logFC")
+topMvMo <- cbind(topMvMo, Annotation.known[row.names(topMvMo), ])
+write.table(topMvMo, file = "/home/mmallee/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Mutagenic_vs_Mock_FINAL_batch.txt", sep = "\t", col.names = NA)
+
+# Supplementary Data 2 tab 4: safe vs mock
+topSvMo <- topTable(fit2, coef = 2, n = Inf, adjust.method = "BH", sort.by = "logFC")
+topSvMo <- cbind(topSvMo, Annotation.known[row.names(topSvMo), ])
+write.table(topSvMo, file = "/home/mmallee/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Safe_vs_Mock_FINAL_batch.txt", sep = "\t", col.names = NA)
+
+# Supplementary Data 2 tab 5
+topMvS <- topTable(fit2, coef = 4, n = Inf, adjust.method = "BH", sort.by = "logFC")
+topMvS <- cbind(topMvS, Annotation.known[row.names(topMvS), ])
+write.table(topMvS, file = "/home/mmallee/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Mutagenic_vs_Safe_FINAL_batch.txt", sep = "\t", col.names = NA)
+
+sheets <- list("Mutagenic vs Mock and Safe" = topMvMoS, "Mutagenic vs Mock" = topMvMo, 
+               'Mutagenic vs Safe' = topMvS, 'Safe vs Mock' = topSvMo)
+# write_xlsx(sheets, "/home/mmallee/SAGA_GEX_Analysis/saga412/Supplemental_table_S2.xlsx")
+write_xlsx(sheets, "/home/mmallee/SAGA_GEX_Analysis/saga258/Supplemental_table_S2b.xlsx")
+
+
+
+# Read again
+topMvMo <- read.table('~/SAGA_GEX_Analysis/saga258/Toplist_FullSagaSet258_Mutagenic_vs_Mock_FINAL_batch.txt', header = T, sep = '\t')
+top.1_orig_MvMo <- readxl::read_excel(path = "~/Hannover_data/1-s2.0-S1525001621003233-mmc3.xlsx", sheet = 3, col_names = T, skip = 1)
+
+# Original vs new volcano plots
+EnhancedVolcano(toptable = topMvS, x = "logFC", y = "P.Value", lab = topMvS$GeneSymbol_FINAL, title = "Mutagenic vs Safe", subtitle = "Unpublished", xlim = c(-2, 4), ylim = c(-1, 40), pCutoff = 0.05)
+EnhancedVolcano(toptable = topMvMo, x = "logFC", y = "P.Value", lab = topMvMo$GeneSymbol_FINAL, title = "Mutagenic vs Mock", subtitle = "Unpublished", xlim = c(-2, 4), ylim = c(-1, 40), pCutoff = 0.05)
+EnhancedVolcano(toptable = topMvMoS, x = "logFC", y = "P.Value", lab = topMvMoS$GeneSymbol_FINAL, title = "Mutagenic vs Safe+Mock", subtitle = "Unpublished", xlim = c(-2, 4), ylim = c(-1, 40), pCutoff = 0.05)
+EnhancedVolcano(toptable = topSvMo, x = "logFC", y = "P.Value", lab = topSvMo$GeneSymbol_FINAL, title = "Safe vs Mock", subtitle = "Unpublished", xlim = c(-2, 4), ylim = c(-1, 40), pCutoff = 0.05)
+
+EnhancedVolcano(toptable = top.2_orig_SvMo, x = "logFC", y = "P.Value", lab = top.2_orig_SvMo$GeneSymbol_FINAL, title = "Safe vs Mock", subtitle = "Published", xlim = c(-2, 4), ylim = c(-1, 40), pCutoff = 0.05)
+
+#look at overlapping genes
+
+overlapping_deg_MvS_up <- intersect(topMvS$GeneSymbol_FINAL[topMvS$logFC > 1], top.4_origMvS$GeneSymbol_FINAL[top.4_origMvS$logFC > 1])
+overlapping_deg_MvS_down <- intersect(topMvS$GeneSymbol_FINAL[topMvS$logFC < -1], top.4_origMvS$GeneSymbol_FINAL[top.4_origMvS$logFC < -1])
+
+overlapping_deg_MvMoS_up <- intersect(topMvMoS$GeneSymbol_FINAL[topMvMoS$logFC > 1], top.3_orig_MvMoS$GeneSymbol_FINAL[top.3_orig_MvMoS$logFC > 1])
+overlapping_deg_MvMoS_down <- intersect(topMvMoS$GeneSymbol_FINAL[topMvMoS$logFC < -1], top.3_orig_MvMoS$GeneSymbol_FINAL[top.3_orig_MvMoS$logFC < -1])
+
+overlapping_deg_MvMo_up <- intersect(topMvMo$GeneSymbol_FINAL[topMvMo$logFC > 1], top.1_orig_MvMo$GeneSymbol_FINAL[top.1_orig_MvMo$logFC > 1])
+overlapping_deg_MvMo_down <- intersect(topMvMo$GeneSymbol_FINAL[topMvMo$logFC < -1], top.1_orig_MvMo$GeneSymbol_FINAL[top.1_orig_MvMo$logFC < -1])
+
+overlapping_deg_SvMo_up <- intersect(topSvMo$GeneSymbol_FINAL[topSvMo$logFC > 1], top.2_orig_SvMo$GeneSymbol_FINAL[top.2_orig_SvMo$logFC > 1])
+overlapping_deg_SvMo_down <- intersect(topSvMo$GeneSymbol_FINAL[topSvMo$logFC < -1], top.2_orig_SvMo$GeneSymbol_FINAL[top.2_orig_SvMo$logFC < -1])
+```
+
+### Compare original DEGs vs new
+```{r}
+# Select matching probes
+matching <- intersect(top.1_orig_MvMo$PROBEID, rownames(topMvMo))
+
+degdf <- data.frame(probe = top.1_orig_MvMo$PROBEID, Original_logFC = top.1_orig_MvMo$logFC)
+degdf <- data.frame(degdf, New_logFC = topMvMo[match(degdf$probe, rownames(topMvMo)), 1])
+ggscatter(data = degdf, x = 'Original_logFC', y = 'New_logFC', add = 'reg.line', add.params = list(color = 'red', fill = 'lightgray'), conf.int = T) + stat_cor(method = 'pearson') + ggtitle(label = 'logFC correlation for matching probes between published data \nDEGs and unpublished data DEGs', subtitle = 'Mutagenic vs. Mock')
+```
+
+
+
+### GSEA with fgsea
+```{r}
+# BiocManager::install("fgsea")
+library(fgsea)
+
+topMvMo <- read.table('~/SAGA_GEX_Analysis/saga258/Toplist_FullSagaSet258_Mutagenic_vs_Mock_FINAL_batch.txt', header = T, sep = '\t')
+topMvMoS_412 <- read.table('~/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Mutagenic_vs_Mock_and_Safe_FINAL_batch.txt', header = T, sep = '\t')
+# Use handselected first
+sets <- readxl::read_excel(path = "~/Hannover_data/1-s2.0-S1525001621003233-mmc4.xlsx", sheet = 1, skip = 1, col_names = T)[, -2] # 106 GeneSets
+# sets_MvsMo_orig <- readxl::read_excel(path = "~/Hannover_data/1-s2.0-S1525001621003233-mmc4.xlsx", sheet = 2, skip = 1, col_names = T)[, -2] # 106 GeneSets
+# colnames(sets_MvsMo_orig)[c(1, 4, 5)] <- c('pathway', 'pval', 'padj')
+
+sets <- lapply(split(sets[, -1], sets[, 1]), unlist)
+sets <- lapply(sets, function(x) {
+  x[!is.na(x)]
+})
+
+mast_sets <- GSA.read.gmt(filename = '~/genesets.v2023.2.Hs_mast.gmt')
+names(mast_sets$genesets) <- mast_sets$geneset.names
+sets <- append(sets, mast_sets$genesets)
+
+
+
+genes <- unique(unlist(sets))
+
+
+## Add signature matrix gene sets
+# sig_mat <- read.table('/exports/immu-staallab/Micah/signature_matrix_DMC_C.txt', header = T, sep = '\t', row.names = 1)
+# 
+# sig_mat$highest <- colnames(sig_mat)[max.col(sig_mat, ties.method = "first")]
+# table(sig_mat$highest)
+# 
+# sig_mat_sets <- lapply(unique(sig_mat$highest), function(ct) {
+#   tmp <- sig_mat[sig_mat$highest == ct, ]
+#   return(rownames(tmp))
+# })
+# names(sig_mat_sets) <- paste0(colnames(sig_mat[1:10]), '_SIG_MAT')
+# 
+# sets <- append(sets, sig_mat_sets)
+
+eset.batch <- eset_412
+
+# Make DataSet with one probe for each gene (select probe with highest variation)
+eset <- data.frame(eset.batch, GeneSymbol = Annotation.known$GeneSymbol_FINAL)
+eset.gsea <- subset(eset, toupper(eset$GeneSymbol) %in% genes) # take all probes with entries in GSEA-Sets
+eset.sd <- apply(eset.gsea[1:length(eset.gsea) - 1], 1, sd)
+eset.sd.order <- eset.gsea[order(eset.sd, decreasing = T), ]
+eset.gsea <- subset(eset.sd.order, !duplicated(eset.sd.order$GeneSymbol))
+matrix.gsea <- as.matrix(eset.gsea[, c(1:length(eset.gsea) - 1)])
+Annotation.GSEA <- Annotation.known[row.names(eset.gsea), ]
+
+# Filter for unique genes
+genes <- genes[genes %in% toupper(Annotation.GSEA$GeneSymbol_FINAL)]
+
+topMvMoS_412 <- topMvMoS_412[topMvMoS_412$X %in% rownames(Annotation.GSEA), ]
+
+
+
+# Creating ranks
+ranks <- topMvMoS_412$logFC[toupper(topMvMoS_412$GeneSymbol_FINAL) %in% genes]
+names(ranks) <- toupper(topMvMoS_412$GeneSymbol_FINAL[toupper(topMvMoS_412$GeneSymbol_FINAL) %in% genes])
+
+# top.1_orig <- readxl::read_excel(path = "~/Hannover_data/1-s2.0-S1525001621003233-mmc3.xlsx", sheet = 3, col_names = T, skip = 1)
+# top.1_orig <- top.1_orig[top.1_orig$PROBEID %in% rownames(Annotation.GSEA), ]
+# ranks <- top.1_orig$logFC[toupper(top.1_orig$GeneSymbol_FINAL) %in% genes]
+# names(ranks) <- toupper(top.1_orig$GeneSymbol_FINAL[toupper(top.1_orig$GeneSymbol_FINAL) %in% genes])
+
+# Plot ranks
+barplot(sort(ranks, decreasing = T))
+
+
+# Load pathways (GeneSets)
+pathways <- gmtPathways('/home/mmallee/SAGA_GEX_Analysis/Full_dataset/c2.c3.c5.c6.h.6.2.symbols.gmt')
+
+fgseaRes <- fgsea(pathways = sets, ranks, minSize = 15, maxSize = 500)
+fgseaRes <- fgsea::fgseaMultilevel(pathways = sets, ranks, minSize = 15, maxSize = 500, nPermSimple = 10000)
+
+fgseaRes_full <- fgsea::fgseaMultilevel(pathways = pathways, ranks, minSize = 15, maxSize = 500, nPermSimple = 10000)
+# Plot NES
+plotEnrichment(sets[["WONG_EMBRYONIC_STEM_CELL_CORE"]], ranks)
+
+fgseaRes$color <- sets_MvsMo_orig$`Color (Hex)`[match(toupper(fgseaRes$pathway), sets_MvsMo_orig$`GENE SET`)]
+
+plot(log10(fgseaRes$padj), fgseaRes$NES, ylab = "Normalized enrichment score (NES)", xlab = "FDR (log10)", pch = 16, cex = 3)
+segments(log10(0.10),-5,log10(0.10),5, lty = 2)
+
+plot(log10(sets_MvsMo_orig$padj), y = sets_MvsMo_orig$NES, ylab = "Normalized enrichment score (NES)", xlab = "FDR (log10)", pch = 16, cex = 3, col = sets_MvsMo_orig$`Color (Hex)`, ylim = c(-2, 5))
+segments(log10(0.10),-5,log10(0.10),5, lty = 2)
+
+topPathwaysUp <- fgseaRes[NES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes[NES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+sign_genes <- fgseaRes[grep("SIG_MAT", fgseaRes$pathway), ][order(NES, decreasing = T)]
+
+plotGseaTable(sets[topPathways], ranks, fgseaRes, gseaParam=0.5)
+plotGseaTable(sets[sign_genes$pathway], ranks, fgseaRes, gseaParam=0.5)
+
+
+
+# Export gene sets
+setsdf <- as.data.frame(cbind(sets))
+mx <- max(lengths(sets))
+d1 <- as.data.frame(t(data.frame(lapply(sets, `length<-`, mx))))
+d1 <- cbind(GeneSet = rownames(d1), d1)
+
+writexl::write_xlsx(d1, 'Supplemental_Table_S3_GSEA_Sets.xlsx')
+```
+
+### Remove mast specific genes and export expression matrix
+```{r}
+# Load prefiltered probes
+iqr_filt <- read.table('~/SAGA_Model_3.0/Annotation.matrix.train.FINAL_batch.txt', header = T)
+GA.FINAL <- readRDS("~/SAGA_Model_3.0/gafinal.rds")
+predictors <- Annotation.known[GA.FINAL$optVariables, ]
+
+
+# Look at signature matrix genes
+sig_mat <- read.table('/exports/immu-staallab/Micah/signature_matrix_DMC_C.txt', header = T, row.names = 1)
+sig_mat$highest <- colnames(sig_mat)[max.col(sig_mat, ties.method = "first")]
+table(sig_mat$highest)
+mast_genes <- rownames(sig_mat[sig_mat$highest == 'Mast_cell', ])
+
+# Mast genes in prefilt and predictors
+mast_filt <- mast_genes[mast_genes %in% toupper(iqr_filt$GeneSymbol_FINAL)]
+mast_pred <- mast_genes[mast_genes %in% toupper(predictors$GeneSymbol_FINAL)]
+FindVariableFeatures()
+
+
+# Signature genes in prefilt and predictors
+sig_filt <- rownames(sig_mat)[rownames(sig_mat) %in% toupper(iqr_filt$GeneSymbol_FINAL)] #%>% length()
+sig_pred <- rownames(sig_mat)[rownames(sig_mat) %in% toupper(predictors$GeneSymbol_FINAL)] #%>% length()
+
+ct_pseudo <- AggregateExpression(real_seurat, group.by = c('cell_type', 'Condition'), assays = 'RNA', return.seurat = T)
+
+mock_cells <- subset(real_seurat, subset = Condition == 'mock')
+mutagenic_cells <- subset(real_seurat, subset = Condition == 'RSF91')
+
+mock_hvf <- HVFInfo(object = mock_cells)
+mutagenic_hvf <- HVFInfo(object = mutagenic_cells)
+pseudo_hvf <- HVFInfo(object = ct_pseudo, assay = 'RNA', method = 'vst')
+
+
+total_genes <- unique(c(rownames(sig_mat), toupper(names(iqr_scaled_filt))))
+
+
+# Look at variable scRNAseq genes
+real_seurat <- readRDS('/exports/immu-staallab/Micah/pData.final.RDS')
+Idents(real_seurat) <- 'cell.types'
+new.cluster.ids <- c("Mast_cell", "Basophil", "Mast_cell", "Mast_cell", "Mast_cell", "Mast_cell/Basophil", 
+    "Macrophage", "Basophil", "Macrophage", 'Macrophage', 'Mast_cell', 'Macrophage', 'DC/Macrophage', 'HSPC', 'Mast_cell', 'Unknown', 'CMP', 'Neutrophil', 'MEP', 'Unknown')
+names(new.cluster.ids) <- levels(real_seurat)
+real_seurat <- RenameIdents(real_seurat, new.cluster.ids)
+real_seurat$cell_type <- real_seurat@active.ident
+
+
+iqr_scaled <- apply(real_seurat@assays[["RNA"]]@counts, 1, IQR)
+boxplot(iqr_scaled)
+iqr_scaled_filt <- iqr_scaled[iqr_scaled > 0.2]
+
+# scRNA filt genes in prefilt and predictors
+scRNA_genes_iqr0.2 <- toupper(names(iqr_scaled_filt))[toupper(names(iqr_scaled_filt)) %in% toupper(iqr_filt$GeneSymbol_FINAL)]
+
+scRNA_genes_iqr0.2 %in% toupper(predictors$GeneSymbol_FINAL)  %>% sum()
+
+seq_filt <- scRNA_genes_iqr0.2
+seq_pred <- scRNA_genes_iqr0.2[scRNA_genes_iqr0.2 %in% toupper(predictors$GeneSymbol_FINAL)]
+
+# scRNA filt genes in signature matrix
+scRNA_genes_iqr0.2 %in% rownames(sig_mat) %>% sum()
+
+
+
+# Look at variable features
+sum(toupper(real_seurat@assays[["RNA"]]@var.features) %in% rownames(sig_mat))
+```
+
+
+### Remove cell type specific genes and export expression matrix to build model on
+```{r}
+# Use a coefficient of variance cut-off = sd/mean
+# Get pseudobulks per cell type
+ct_pseudo <- AggregateExpression(object = real_seurat, assays = 'RNA', return.seurat = T, group.by = 'cell_type')
+
+
+df <- data.frame(sd = apply(ct_pseudo@assays$RNA$counts, 1, sd), mean = apply(ct_pseudo@assays$RNA$counts, 1, mean))
+df$CV <- df$sd/df$mean
+df$CV[df$mean == 0] <- 0
+
+# First select genes based on total counts, to not have only genes with < 50 counts
+counts <- ct_pseudo@assays$RNA$counts
+
+df$counts <- apply(counts, 1, sum)
+
+ggplot(df, aes(x=log2(counts))) + geom_density() + geom_vline(xintercept = log2(50), color = '#CB181D') + ggtitle('Counts density \n(log2 transformed)') + ggplot(df, aes(x=CV)) + geom_density() + geom_vline(xintercept = 2, color = '#CB181D') + ggtitle('Coefficient of variance')# + geom_vline(xintercept = 3, linetype = 'dashed')
+
+filt_genes <- rownames(df[df$counts >= 50 & df$CV > 2,])
+
+sum(filt_genes %in% iqr_filt$GeneSymbol_FINAL) # 451 genes are present in predictor set
+sum(filt_genes %in% predictors$GeneSymbol_FINAL) # 40 genes are present in predictor set
+
+filt_probes <- rownames(Annotation.known[Annotation.known$GeneSymbol_FINAL %in% filt_genes, ])
+
+sum(filt_probes %in% iqr_filt$X) # 451 probes are present in predictor set
+sum(filt_probes %in% rownames(predictors)) # 40 genes are present in predictor set
+
+write.table(filt_probes, '/exports/immu-staallab/Micah/CV_filtered_probes.txt')
+
+ok <- read.table('/exports/immu-staallab/Micah/CV_filtered_probes.txt')
+```
+
+
+### Test simulated bulks for prediction
+```{r}
+library(SimBu)
+library(Seurat)
+
+dataset <- dataset(annotation = real_seurat@meta.data, count_matrix = real_seurat@assays$RNA$counts, name = "test_dataset")
+simulation_random <- simulate_bulk(data = dataset, scenario = "random", scaling_factor = "NONE")
+
+real_seurat$ID <- colnames(real_seurat)
+mock_cells <- subset(real_seurat, subset = Condition == 'mock')
+mutagenic_cells <- subset(real_seurat, subset = Condition == 'RSF91')
+
+dataset_mock <- SimBu::dataset(annotation = mock_cells@meta.data, count_matrix = mock_cells@assays$RNA$counts, name = 'Mock', filter_genes = F)
+dataset_mutagenic <- SimBu::dataset(annotation = mutagenic_cells@meta.data, count_matrix = mutagenic_cells@assays$RNA$counts, name = 'Mutagenic', filter_genes = F)
+
+make_pseudobulks <- function(seurat_obj) {
+  weighted_sims_mast <- lapply(c(0, 0.2, 0.4, 0.6, 0.8, 0.99), function(x){
+    simulate_bulk(data = seurat_obj, scenario = "weighted", scaling_factor = "NONE", weighted_cell_type = 'Mast_cell', weighted_amount = x, nsamples = 20)})
+  weighted_sims_mast_bas <- lapply(c(0, 0.2, 0.4, 0.6, 0.8, 0.99), function(x){
+    simulate_bulk(data = seurat_obj, scenario = "weighted", scaling_factor = "NONE", weighted_cell_type = 'Mast_cell/Basophil', weighted_amount = x, nsamples = 20)})
+    weighted_sims_bas <- lapply(c(0, 0.2, 0.4, 0.6, 0.8, 0.99), function(x){
+    simulate_bulk(data = seurat_obj, scenario = "weighted", scaling_factor = "NONE", weighted_cell_type = 'Basophil', weighted_amount = x, nsamples = 20)})
+  merged <- merge_simulations(c(weighted_sims_mast, weighted_sims_mast_bas, weighted_sims_bas))
+  return(merged)
+}
+
+simulated_bulks <- lapply(list(dataset_mock, dataset_mutagenic), make_pseudobulks)
+
+simulated_bulks_merged <- merge_simulations(simulated_bulks)
+plot_simulation(simulated_bulks_merged)
+
+bulk_counts <- as.data.frame(simulated_bulks_merged[["bulk"]]@assays@data@listData[["bulk_counts"]])
+
+
+
+####### PURE PSEUDOBULKS
+ct_pseudo <- AggregateExpression(real_seurat, group.by = 'Sample', assays = 'RNA')
+bulk_counts <- as.data.frame(ct_pseudo$RNA)
+
+
+
+###### end pure pseudobulks
+
+# First load eset.batch and create matrix with only one probe per gene above
+# Make DataSet with one probe for each gene (select probe with highest variation)
+eset <- data.frame(eset.batch, GeneSymbol = Annotation.known$GeneSymbol_FINAL)
+eset.sd <- apply(eset[1:length(eset) - 1], 1, sd)
+eset.sd.order <- eset[order(eset.sd, decreasing = T), ]
+eset <- subset(eset.sd.order, !duplicated(eset.sd.order$GeneSymbol))
+matrix.gsea <- as.matrix(eset[, c(1:length(eset) - 1)])
+Annotation.GSEA <- Annotation.known[row.names(eset), ]
+
+# Give simulated bulks correct probes as rownames
+bulk_counts_matching_probes <- bulk_counts[rownames(bulk_counts) %in% Annotation.GSEA$GeneSymbol_FINAL, ]
+rownames(bulk_counts_matching_probes) <- rownames(bulk_counts_matching_probes) <- rownames(Annotation.GSEA)[match(rownames(bulk_counts_matching_probes), Annotation.GSEA$GeneSymbol_FINAL)] %>% .[!is.na(.)]
+
+# Predict
+pData_simbu <- data_frame(Sample = ct_pseudo[["RNA"]]@Dimnames[[2]], Batch = rep(200, ncol(bulk_counts_matching_probes)), Design = c(rep(times =3, x = 'A2_Mock'), rep(times = 3, x = 'A1_Mutagenic')))
+
+pData_simbu <- data.frame(Sample = simulated_bulks_merged[["bulk"]]@colData@rownames, Batch = rep(200, ncol(bulk_counts_matching_probes)), Design = c(rep('A2_Mock', 360), rep('A1_Mutagenic', 360)))
+
+Prediction_SVM.Caret <- cbind(simulated_bulks_merged[["cell_fractions"]], Prediction_SVM.Caret, design = pData_simbu$Design)
+
+ggscatter(Prediction_SVM.Caret, x= 'Mast_cell', y = 'transforming', add = 'reg.line', add.params = list(color = 'blue', fill = 'lightgray'), conf.int = T) + stat_cor(method = 'pearson', label.x = 0.5, color = 'red', label.y = 0.85) + facet_wrap(~design)
+
+ggscatter(Prediction_SVM.Caret, x= 'Basophil', y = 'transforming', add = 'reg.line', add.params = list(color = 'blue', fill = 'lightgray'), conf.int = T) + stat_cor(method = 'pearson', label.x = 0.5, color = 'red', label.y = 0.85) + facet_wrap(~design)
+
+colnames(Prediction_SVM.Caret)[5] <- 'mast_basophil'
+
+ggscatter(Prediction_SVM.Caret, x= 'mast_basophil', y = 'transforming', add = 'reg.line', add.params = list(color = 'blue', fill = 'lightgray'), conf.int = T) + stat_cor(method = 'pearson', label.x = 0.5, color = 'red', label.y = 0.85) + facet_wrap(~design)
+```
+
+
+### SAGA-GSEA
+```{r}
+# Load packages
+library(phenoTest)
+library(limma)
+library(gridExtra)
+library(pROC)
+library(caret)
+library(purrr)
+
+# Read data
+## load the Top 11 SAGA features from SVM-GA for FullSet230: 
+genefilt_set <- read.delim("~/SAGA_Model_4.0_nomastgenes/FinalSet230_optVars_GeneticAlgorithm.txt", header = T, sep = "\t", row.names = 1)
+genefilt_set <- rownames(genefilt_set)
+gafinal <- readRDS("~/SAGA_Model_5.0_Full_dataset/Final_412/gafinal.rds")
+new_set <- gafinal$optVariables
+sets_11 <- rownames(saga::Top11)
+topMvMo <- read.table('~/SAGA_GEX_Analysis/saga258/Toplist_FullSagaSet258_Mutagenic_vs_Mock_FINAL_batch.txt', header = T, sep = '\t')
+topMvMo_412 <- read.table('~/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Mutagenic_vs_Mock_FINAL_batch.txt', header = T, sep = '\t')
+MvMo_114 <- topMvMo[topMvMo$X %in% genefilt_set,]
+upreg_99 <- MvMo_114[MvMo_114$logFC > 0, "X"]
+fc_geneset <- read.table('fc_geneset104.txt')[,1]
+
+
+
+MvMo_74 <- topMvMo_412[topMvMo_412$X %in% new_set,]
+upreg_67 <- MvMo_74[MvMo_74$logFC > 0, "X"]
+
+SAGA.CORE <- list(top114 = genefilt_set, top11 = sets_11, top99 = upreg_99)
+SAGA.CORE <- list(top67 = upreg_67, top11 = sets_11)
+
+# Read sample information and loop over batches seperately (each batch has mock samples available)
+SIF <- read.delim("~/pData_train_258.csv", row.names = 1, header = TRUE, sep = "\t", stringsAsFactors = F)
+SIF <- read.delim('~/Full_Sample_information_merged.csv', row.names = 1, header = T, sep = '\t')
+SIF <- SIF[SIF$Day == 15,]
+
+SIF <- read.csv('/home/mmallee/pData_train_412.csv', header = T)
+batches <- levels(as.factor(SIF$Batch)) # how many assays / batches 
+result.all <- NULL # dummy data.frame
+SIF$Group[SIF$Design == 'A2_Mock'] <- 1
+
+# Which batches have no mock samples?
+table(SIF$Batch, SIF$Design) #  batch 11 has no mock, remove this
+batches <- batches[-which(batches == 11)]
+
+# Give each sample group nr 2:nsamples per batch
+for (batch in batches) {
+  nonmock <- SIF[SIF$Batch == batch & !SIF$Design == 'A2_Mock',]
+  SIF[rownames(nonmock), "Group"] <- 2:(nrow(nonmock)+1)
+}
+
+
+# read quadruplicates for all day 15 samples
+quad700 <- read.table('/exports/immu-staallab/Micah/RAW_FullSagaSet700_quadruplicates_FINAL.txt', sep = '\t', header = T)[, -1]
+FC_100_all <- list()
+FC_full <- list()
+# SAGA-GSEA Loop over all batches 
+# norm, average, make expressionset, make epheno object, run gsea, export results
+for(batch in batches) {   
+  # Subset quadruplicates for batch
+  SIF.i <- SIF[SIF$Batch==batch, ]
+  
+  # Format as EListRaw so Limma functions perform as expected (log transform before normalization and averaging)
+  E.batch <- quad700[, SIF.i$Sample_ID]
+  E <- new("EListRaw", list(E = E.batch, genes = data.frame(ProbeName = quad700$ProbeID), targets = colnames(E.batch), source = 'agilent.median'))
+  
+  # Quantile normalization and averaging
+  eset.rma <- normalizeBetweenArrays(object = E, method = "quantile")
+  eset.rma <- avereps(eset.rma, ID = eset.rma$genes$ProbeName)
+  matrix.gsea <- eset.rma$E
+  
+  # Create ExpressionSet
+  metadata  <- data.frame(labelDescription = rep(NA, dim(SIF.i)[2]), row.names = colnames(SIF.i))
+  phenoData <- new("AnnotatedDataFrame", data = SIF.i, varMetadata = metadata)
+  rownames(phenoData) <- colnames(matrix.gsea)
+  eset.gsea <- ExpressionSet(assayData = matrix.gsea, phenoData = phenoData)
+  
+  # Create ePheno object
+  vars2test   <- list(ordinal = "Group") # Variables (here: Vectors) to test against MOCK, which is always = 1 in the SIF 
+  epheno.gsea <- ExpressionPhenoTest(eset.gsea, vars2test, p.adjust.method = 'BH')
+  
+  # GSEA
+  SAGA.GSEA <- gsea(x = epheno.gsea, gsets = SAGA.CORE , B = 6000, center = TRUE, test = "perm", p.adjust.method = 'BH')
+  result <- summary.gseaData(SAGA.GSEA)[, c(1, 2, 3, 5, 8)] # extract results (only NES-normalized enrichment scores)
+  
+  
+  # Export high mutagenic FC genes
+  mutagenic_groups <- SIF.i$Group[SIF.i$Design == 'A1_Mutagenic']
+  # Use lapply to iterate over mutagenic_groups
+  FC_100 <- unlist(lapply(mutagenic_groups, function(group) {
+    FC_100_mutagenic <- sort(SAGA.GSEA[["simulations"]][[paste0("Group.", group, '.fc')]][["fc.hr"]], decreasing = TRUE)[1:100]
+  }))
+  
+  nrgroups <- unique(SIF.i$Group[!SIF.i$Group == 1])
+  FC_per_set <- lapply(nrgroups, function(group) {
+    fc_114 <- SAGA.GSEA[["simulations"]][[paste0("Group.", group, '.fc')]][["fc.hr"]][SAGA.CORE$top114]
+    fc_11 <- SAGA.GSEA[["simulations"]][[paste0("Group.", group, '.fc')]][["fc.hr"]][SAGA.CORE$top11]
+    fc_99 <- SAGA.GSEA[["simulations"]][[paste0("Group.", group, '.fc')]][["fc.hr"]][SAGA.CORE$top99]
+    return(list(fc_114, fc_11, fc_99))
+  })
+  
+  names(FC_per_set) <- SIF.i$Sample_ID[!SIF.i$Group == 1]
+  
+  FC_full <- append(FC_full, FC_per_set)
+  FC_100_all <- append(FC_100_all, FC_100)
+  
+  # Export
+  Group <- NULL    ### pull out the Group index number from the result table                  
+  for (a in 1:nrow(result)) {Group[a] <- unlist(strsplit(as.character(result$variable[a]), '.', fixed = TRUE))[2] }
+  result$Group     <- Group
+  
+  SIF.sub           <- SIF.i[SIF.i$Group != 1, c('Group','Design')] # pull out info of tested vectors                    
+  SIF.sub$SampleID  <- row.names(SIF.sub)
+  result.m          <- merge(SIF.sub,result, by.x="Group", by.y = "Group") # merge result with SIF for SampleIDs and FileNames
+  result.all        <- rbind(result.all, result.m)                           # merge all results to one file
+  write.table(result.m, file = paste("~/SAGA_GSEA_results/Results_SAGA.GSEA_Batch_", batch,".txt", sep = ""), sep = "\t", row.names = FALSE)
+  # make pdf
+  pdf(file=paste("~/SAGA_GSEA_results/SAGA.GSEA_Batch_", batch, ".pdf", sep = ""), useDingbats = F, width = 10, height = 10)
+  grid.table(result.m, rows = NULL)
+  plot.gseaData(SAGA.GSEA, es.nes ='nes', selGsets='top11')
+  plot.gseaData(SAGA.GSEA, es.nes ='nes', selGsets='top67', selVars = 'Group.2.fc')
+  # plot.gseaData(SAGA.GSEA, es.nes ='nes', selGsets='top114')
+  # plot.gseaData(SAGA.GSEA, es.nes ='nes', selGsets='top99')
+  # plot.gseaData(SAGA.GSEA, es.nes ='nes', selGsets='fc_104')
+  dev.off()
+}
+
+saveRDS(FC_100_all, 'FC_100_all.rds')
+saveRDS(FC_full, 'FC_full.rds')
+
+# Read results again
+
+results_true <- lapply(batches, function(batch){
+  read.table(file = paste("~/SAGA_GSEA_results/Results_SAGA.GSEA_Batch_", batch,".txt", sep = ""), sep = "\t", header = T)
+})
+results_all <- data.table::rbindlist(results_true)
+
+results_top11 <- results_all[results_all$geneSet == 'top11',]
+results_top67 <- results_all[results_all$geneSet == 'top67',]
+results_top114 <- results_all[results_all$geneSet == 'top114',]
+# results_top159 <- results_all[results_all$geneSet == 'top159',]
+results_top99 <- results_all[results_all$geneSet == 'top99',]
+
+Results_11 <- merge(SIF, results_top11, by.x = 0, by.y = "SampleID", all.x = F)
+Results_67 <- merge(SIF, results_top67, by.x = 0, by.y = "SampleID", all.x = F)
+Results_114 <- merge(SIF, results_top114, by.x = 0, by.y = "SampleID", all.x = F)
+# Results_159 <- merge(SIF, results_top159, by.x = 0, by.y = "SampleID", all.x = F)
+Results_99 <- merge(SIF, results_top99, by.x = 0, by.y = "SampleID", all.x = F)
+rownames(Results_11) <- Results_11$Row.names
+rownames(Results_67) <- Results_67$Row.names
+rownames(Results_114) <- Results_114$Row.names
+# rownames(Results_159) <- Results_159$Row.names
+rownames(Results_99) <- Results_99$Row.names
+
+
+rm(results_top11, results_top114, results_top159, results_true, results_all)
+
+roc.11 <- roc(Results_11$Class,                    
+                  Results_11$nes,             
+                  percent = TRUE, levels=c("untransforming","transforming"),
+                  plot = T, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+                  print.auc = T, print.thres = "best")
+
+roc.67 <- roc(Results_67$Class,                    
+                  Results_67$nes,             
+                  percent = TRUE, levels=c("untransforming","transforming"),
+                  plot = T, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+                  print.auc = T, print.thres = "best")
+
+
+# roc.114 <- roc(Results_114$Class,                    
+#                   Results_114$nes,             
+#                   percent = TRUE, levels=c("untransforming","transforming"),
+#                   plot = T, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+#                   print.auc = T, print.thres = "best")   # best threshold = 1.0  ==> 88% sensitivity, 74% specificity
+
+# roc.159 <- roc(Results_159$Class,
+#                   Results_159$nes,             
+#                   percent = TRUE, levels=c("untransforming","transforming"),
+#                   plot = T, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+#                   print.auc = T, print.thres = "best")   # best threshold = 1.0  ==> 88% sensitivity, 74% specificity
+
+# roc.99 <- roc(Results_99$Class,                    
+#                   Results_99$nes,             
+#                   percent = TRUE, levels=c("untransforming","transforming"),
+#                   plot = T, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+#                   print.auc = T, print.thres = "best")   # best threshold = 1.0  ==> 88% sensitivity, 74% specificity
+
+
+# roc.list <- list(roc.11, roc.114, roc.159)
+roc.list <- list(roc.11, roc.114, roc.99)
+roc.list <- list(roc.11, roc.67)
+
+# extract auc
+roc.list %>% 
+  map(~tibble(AUC = .x$auc)) %>% data.table::rbindlist() -> data.auc
+# data.auc$name <- c('Original predictors (11)', 'Cell type filtered predictors (114)', 'No gene filtering (159)')
+# data.auc$name <- c('Original predictors (11)', 'Cell type filtered predictors (114)', 'Only upregulated (99)')
+data.auc$name <- c('Original predictors (11)', 'Upregulated new predictors (67)')
+
+# generate labels labels
+data.auc %>% 
+  mutate(label_long=paste0(name," , AUC = ",paste(round(AUC,2))),
+         label_AUC=paste0("AUC = ",paste(round(AUC,2)))) -> data.labels
+
+
+data.labels <- cbind(data.labels, lapply(roc.list, coords, 'best', input = 'threshold', ret = c("threshold", 'specificity', 'sensitivity')) %>% data.table::rbindlist())
+
+# names(roc.list) <- c('Original predictors (11)', 'Cell type filtered predictors (114)', 'No gene filtering (159)')
+# names(roc.list) <- c('Original predictors (11)', 'Cell type filtered predictors (114)', 'Only upregulated (99)')
+names(roc.list) <- c('Original predictors (11)', 'Upregulated new predictors (67)')
+
+ggroc(roc.list) + facet_wrap(~name) + theme(legend.position = 'none') + geom_text(data.labels, mapping = aes(0.5, 1, label= paste(label_AUC)), hjust = 1) + geom_text_repel(data.labels, mapping = aes(specificity, sensitivity, label = paste0(
+  round(threshold, 1), ' (', 
+  round(specificity, 1), '%, ', round(sensitivity, 1),'%)')
+  ), nudge_y = -1, min.segment.length = 0, force = 3) + ggtitle('ROC curves for each GSEA predictor set') + theme_pubclean() + theme(legend.position = 'none')
+
+
+Results_11$Prediction_GSEA <- ifelse(Results_11$nes > 1.6, 'transforming', 'untransforming')
+# Results_114$Prediction_GSEA <- ifelse(Results_114$nes > 2, 'transforming', 'untransforming')
+# Results_159$Prediction_GSEA <- ifelse(Results_159$nes > 1.9, 'transforming', 'untransforming')
+# Results_99$Prediction_GSEA <- ifelse(Results_99$nes > 1.7, 'transforming', 'untransforming')
+Results_67$Prediction_GSEA <- ifelse(Results_67$nes > 2, 'transforming', 'untransforming')
+
+
+ggplot(Results_114[!Results_114$Protocol == 'standard (Clones)',], aes(x = Vector, y = nes, col = Design.x)) + ggbeeswarm::geom_quasirandom() + scale_color_manual(values = condition_colors) + facet_wrap(~Protocol, scales = 'free') + geom_hline(yintercept = 1.7, linetype = 'dashed') + theme_pubclean() + theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggplot(Results_11[!Results_11$Protocol == 'standard (Clones)',], aes(x = Vector, y = nes, col = Design.x)) + ggbeeswarm::geom_quasirandom() + scale_color_manual(values = condition_colors) + facet_wrap(~Protocol, scales = 'free') + geom_hline(yintercept = 1.6, linetype = 'dashed') + theme_pubclean() + theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + geom_hline(aes(yintercept = 1), col = 'red', linetype = 'longdash')
+
+ggplot(Results_159[!Results_159$Protocol == 'standard (Clones)',], aes(x = Vector, y = nes, col = Design.x)) + ggbeeswarm::geom_quasirandom() + scale_color_manual(values = condition_colors) + facet_wrap(~Protocol, scales = 'free') + geom_hline(yintercept = 1.9, linetype = 'dashed') + theme_pubclean() + theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+ggplot(Results_67[!Results_67$Protocol == 'standard (Clones)',], aes(x = Vector, y = nes, col = Design.x)) + ggbeeswarm::geom_quasirandom() + scale_color_manual(values = condition_colors) + facet_wrap(~Protocol, scales = 'free') + geom_hline(yintercept = 2, linetype = 'dashed') + theme_pubclean() + theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+
+# Use same ordering as SIF object
+Results_11 <- Results_11[rownames(SIF[SIF$Sample_ID %in% Results_11$Sample_ID,]), ]
+Results_114 <- Results_114[rownames(SIF[SIF$Sample_ID %in% Results_114$Sample_ID,]), ]
+# Results_159 <- Results_159[rownames(SIF[SIF$Sample_ID %in% Results_159$Sample_ID,]), ]
+Results_99 <- Results_99[rownames(SIF[SIF$Sample_ID %in% Results_99$Sample_ID,]), ]
+
+# Export predictions
+Results_merged <- SIF[SIF$Sample_ID %in% Results_11$Sample_ID, ]
+Results_merged$GSEA_NES_11 <- Results_11$nes
+Results_merged$GSEA_Prediction_11 <- Results_11$Prediction_GSEA
+Results_merged$GSEA_NES_141 <- Results_114$nes
+Results_merged$GSEA_Prediction_114 <- Results_114$Prediction_GSEA
+# Results_merged$GSEA_NES_159 <- Results_159$nes
+# Results_merged$GSEA_Prediction_159 <- Results_159$Prediction_GSEA
+Results_merged$GSEA_NES_99 <- Results_99$nes
+Results_merged$GSEA_Prediction_99 <- Results_99$Prediction_GSEA
+Results_merged <- Results_merged[, -c(7, 8)]
+write.csv(Results_merged, '/home/mmallee/GSEA_predictions_with99.csv')
+
+wrong_pred_11 <- subset(Results_merged, subset= (!Class == GSEA_Prediction_11))
+wrong_pred_99 <- subset(Results_merged, subset= (!Class == GSEA_Prediction_99))
+wrong_pred_114 <- subset(Results_merged, subset= (!Class == GSEA_Prediction_114))
+
+cm <- confusionMatrix(data = as.factor(Results_99$Class), as.factor(Results_99$Prediction_GSEA))
+plt <- as.data.frame(cm$table)
+plt$Prediction <- factor(plt$Prediction, levels=rev(levels(plt$Prediction)))
+p <- ggplot(plt, aes(Prediction,Reference, fill= Freq)) +
+geom_tile() + geom_text(aes(label=Freq)) +
+scale_fill_gradient(low="white", high="#259999") +
+labs(x = "Reference",y = "Prediction")+ ggtitle(paste('Confusion matrix 99'), subtitle = paste('Total samples: ', nrow(Results_99))) + theme_pubclean() + theme(legend.position = 'none')
+
+p
+
+plts <- lapply(c(11, 114, 99), function(geneset) {
+  cm <- confusionMatrix(data = as.factor(Results_merged$Class), as.factor(Results_merged[[paste0('GSEA_Prediction_', geneset)]]))
+  plt <- as.data.frame(cm$table)
+  plt$Prediction <- factor(plt$Prediction, levels=rev(levels(plt$Prediction)))
+  p <- ggplot(plt, aes(Prediction,Reference, fill= Freq)) +
+  geom_tile() + geom_text(aes(label=Freq)) +
+  scale_fill_gradient(low="white", high="#259999") +
+  labs(x = "Reference",y = "Prediction")+ ggtitle(paste('Confusion matrix', geneset), subtitle = paste('Total samples: ', nrow(Results_merged[!is.na(Results_merged$Class), ]))) + theme_pubclean() + theme(legend.position = 'none')
+  return(p)
+})
+
+wrap_plots(plts)
+
+
+### investigate fc fluctuations
+ok <- t(as.data.frame(map(FC_full, 1)))
+
+ok <- apply(ok, 1, rank)
+
+df3 <- merge(t(ok), SIF, by.x = 0, by.y = 'Sample_ID')
+df3 <- reshape2::melt(df3, id = c(colnames(SIF)[-12], 'Row.names'))
+ggplot(data = df3[df3$Design %in% c('A1_Mutagenic', 'A3_Safe') & df3$Protocol %in% c('published', 'standard', 'standard (JF)'), ], aes(x = variable, y = value, col = Design)) + ggbeeswarm::geom_quasirandom() + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1), legend.position = 'top') + facet_wrap(~Design) + scale_color_manual(values = condition_colors)
+
+```
+
+
+
+
+### Report sampleinformation
+```{r}
+# Full report pData
+## Only published data and new data from same protocol
+pData_model <- pData_final[pData_final$Protocol %in% c('published'),]
+## Remove test vectors
+pData_model <- pData_model[-grep("test_vector", pData_model$Vector), ]
+
+# Remove test/safe batches
+safebatches <- unique(pData_model$Batch[pData_model$Design == 'A3_Safe'])
+pData_model <- pData_model[!pData_model$Batch %in% safebatches,]
+
+## Remove unknown class samples
+pData_model <- pData_model[!pData_model$Design == 'A4_Unknown', ]
+pData_model <- droplevels(pData_model)
+
+write.csv(pData_model, '/home/mmallee/pData_train_412.csv', row.names = F) # Done
+write.csv(pData_model, '/home/mmallee/pData_train_230.csv', row.names = F) # Done
+write.csv(pData_model, '/home/mmallee/pData_258.csv', row.names = F) # Done
+write.csv(pData_model, '/home/mmallee/pData_169.csv', row.names = F) # Done
+write.csv(pData_model, '/home/mmallee/pData_154.csv', row.names = F) # Done
+
+pData_412 <- read.csv('/home/mmallee/pData_train_412.csv')
+pData_412$Batch <- as.factor(pData_412$Batch)
+pData_230 <- read.csv('/home/mmallee/pData_train_230.csv')
+pData_230$Batch <- as.factor(pData_230$Batch)
+pData_258 <- read.csv('/home/mmallee/pData_258.csv')
+pData_258$Batch <- as.factor(pData_258$Batch)
+pData_169 <- read.csv('/home/mmallee/pData_169.csv')
+pData_169$Batch <- as.factor(pData_169$Batch)
+pData_154 <- read.csv('/home/mmallee/pData_154.csv')
+pData_154$Batch <- as.factor(pData_154$Batch)
+
+# SampleInformation file for testing original SAGA package
+SampleInformation <- pData_model[pData_model$Protocol %in% c('standard', 'standard (JF)'), ]
+
+SampleInformation$Group[SampleInformation$Design == 'A2_Mock'] <- 1
+# Give each sample group nr 2:nsamples per batch
+batches <- levels(as.factor(SampleInformation$Batch))
+for (batch in batches) {
+  nonmock <- SampleInformation[SampleInformation$Batch == batch & !SampleInformation$Design == 'A2_Mock',]
+  SampleInformation[rownames(nonmock), "Group"] <- 2:(nrow(nonmock)+1)
+}
+
+SampleInformation <- SampleInformation[, c('Sample_ID', 'Filename', 'Group', 'Batch', 'Vector', 'Class')]
+colnames(SampleInformation) <- c('SAMPLE_ID', 'Filename', 'Group', 'Batch', 'Vector', 'TrueLabel')
+write.table(SampleInformation, 'SampleInformation.txt', sep = '\t', col.names = T, row.names = F)
+
+SIF <- read.delim(paste(smplpath, "/SampleInformation.txt", 
+    sep = ""), row.names = 1, header = TRUE, sep = "\t", 
+    stringsAsFactors = F)
+
+vector_spread <- as.data.frame.matrix(table(pData$Design, pData$Vector))
+```
+
+
+
+
+### Report figure 1 - GEX Analysis
+```{r}
+# 1a PCA of combined samples
+raw_agilent <- read.table('/exports/immu-staallab/Micah/RAW_FullSagaSet700_quadruplicates_FINAL.txt', sep = '\t', header = T)[, -1]
+eset_412 <- get_BC_eset(pData_412)
+pca <- prcomp(t(eset_412))
+pca_summary <- summary(pca)
+pca_df <- data.frame(x = pca$x[, 1], y = pca$x[, 2]) %>% bind_cols(., pData_412)
+p1a <- ggplot(data = pca_df, aes_string("x", "y", col = "Design")) +
+  geom_point() +
+  ggpubr::theme_pubclean() + theme(legend.key = element_rect(fill = NA)) + 
+  ggtitle(label = paste0("PCA plot of combined samples")) + scale_color_manual(values = condition_colors) + xlab(label = paste0("PC1 - Explained Variance (", round(pca_summary$importance[2, 1] * 100, 1), "%)")) + ylab(label = paste0("PC2 - Explained Variance (", round(pca_summary$importance[2, 2] * 100, 1), "%)"))
+
+# 1b, three panels
+
+# Volcanoplots
+topMvMoS_258 <- read.table('~/SAGA_GEX_Analysis/saga258/Toplist_FullSagaSet258_Mutagenic_vs_Mock_and_Safe_FINAL_batch.txt', header = T, sep = '\t')
+
+topMvMoS_154 <- read.table('~/SAGA_GEX_Analysis/saga154/Toplist_FullSagaSet154_Mutagenic_vs_Mock_and_Safe_FINAL_batch.txt', header = T, sep = '\t')
+
+topMvMoS_412 <- read.table('~/SAGA_GEX_Analysis/saga412/Toplist_FullSagaSet412_Mutagenic_vs_Mock_and_Safe_FINAL_batch.txt', header = T, sep = '\t')
+
+
+top50_match <- topMvMoS_258[topMvMoS_258$X %in% topMvMoS_258$X[which(head(topMvMoS_258$X, 50) %in% head(topMvMoS_154$X, 50))], ]
+
+hlgenes <- head(top50_match$GeneSymbol_FINAL, 15)
+
+# Volcanoplot new data
+p1b1 <- EnhancedVolcano(toptable = topMvMoS_258, x = 'logFC', y = 'adj.P.Val', lab = topMvMoS_258$GeneSymbol_FINAL, labSize = 4, max.overlaps = 10, widthConnectors = 0.75, drawConnectors = T, FCcutoff = 1.5, title = 'Differentially expressed probes', subtitle = 'Mutagenic vs Mock + Safe in unpublished data', caption = NULL, xlim = c(-5, 5), ylim = c(0, 40), selectLab = hlgenes, pCutoff = ) + theme_pubclean() + theme(legend.key = element_rect(fill = NA))
+
+# Volcanoplot published data
+p1b2 <- EnhancedVolcano(toptable = topMvMoS_154, x = 'logFC', y = 'adj.P.Val', lab = topMvMoS_154$GeneSymbol_FINAL, labSize = 4, max.overlaps = 10, widthConnectors = 0.75, drawConnectors = T, FCcutoff = 1.5, title = 'Differentially expressed probes', subtitle = 'Mutagenic vs Mock + Safe in published data', caption = NULL, xlim = c(-5, 5), ylim = c(0, 40), selectLab = hlgenes) + theme_pubclean() + theme(legend.key = element_rect(fill = NA))
+
+p1b3 <- EnhancedVolcano(toptable = topMvMoS_412, x = 'logFC', y = 'adj.P.Val', lab = topMvMoS_412$GeneSymbol_FINAL, labSize = 4, max.overlaps = 10, widthConnectors = 0.75, drawConnectors = T, FCcutoff = 1, title = 'Differentially expressed probes', subtitle = 'Mutagenic vs Mock + Safe in combined data', caption = NULL, xlim = c(-5, 5), ylim = c(0, 40), selectLab = hlgenes) + theme_pubclean() + theme(legend.key = element_rect(fill = NA))
+
+
+p1b <- (p1b1 + p1b2 + p1b3 + plot_layout(guides = 'collect')) & theme(legend.position = 'top')
+
+# GSEA mock vs mutagenic + safe
+library(fgsea)
+eset.batch <- eset_412
+
+sets <- readxl::read_excel(path = "~/Hannover_data/1-s2.0-S1525001621003233-mmc4.xlsx", sheet = 1, skip = 1, col_names = T)[, -2]
+sets <- lapply(split(sets[, -1], sets[, 1]), unlist)
+sets <- lapply(sets, function(x) {
+  x[!is.na(x)]
+})
+
+mast_sets <- GSA.read.gmt(filename = '~/genesets.v2023.2.Hs_mast.gmt')
+names(mast_sets$genesets) <- mast_sets$geneset.names
+sets <- append(sets, mast_sets$genesets)
+genes <- unique(unlist(sets))
+
+# Make DataSet with one probe for each gene (select probe with highest variation)
+eset <- data.frame(eset.batch, GeneSymbol = Annotation.known$GeneSymbol_FINAL)
+eset.gsea <- subset(eset, toupper(eset$GeneSymbol) %in% genes) # take all probes with entries in GSEA-Sets
+eset.sd <- apply(eset.gsea[1:length(eset.gsea) - 1], 1, sd)
+eset.sd.order <- eset.gsea[order(eset.sd, decreasing = T), ]
+eset.gsea <- subset(eset.sd.order, !duplicated(eset.sd.order$GeneSymbol))
+matrix.gsea <- as.matrix(eset.gsea[, c(1:length(eset.gsea) - 1)])
+Annotation.GSEA <- Annotation.known[row.names(eset.gsea), ]
+
+# Filter for unique genes
+genes <- genes[genes %in% toupper(Annotation.GSEA$GeneSymbol_FINAL)]
+
+topMvMoS_412 <- topMvMoS_412[topMvMoS_412$X %in% rownames(Annotation.GSEA), ]
+
+# Creating ranks
+ranks <- topMvMoS_412$logFC[toupper(topMvMoS_412$GeneSymbol_FINAL) %in% genes]
+names(ranks) <- toupper(topMvMoS_412$GeneSymbol_FINAL[toupper(topMvMoS_412$GeneSymbol_FINAL) %in% genes])
+
+fgseaRes <- fgseaMultilevel(pathways = sets, ranks)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+fgseaResTidy <- fgseaResTidy[fgseaResTidy$padj < 0.05,]
+
+p1c <- ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) + geom_col(aes(fill = NES)) +
+  coord_flip() + labs(x = "Pathway", y = "Normalized Enrichment Score", title = "GSEA results Mutagenic vs. Mock/Safe") + theme_pubclean() + scale_fill_gradient2(low = "#b2df8a", high = "#CB181D", midpoint = 0) + theme(legend.position = 'none')
+
+(p1a + (p1b) + plot_layout(widths = c(1, 3))) / patchwork::free(p1c) + plot_layout(heights = c(1, 2)) + plot_annotation(tag_levels = 'A')
+
+
+# Supplemental, foldchange vs foldchange
+joined_fc <- inner_join(topMvMoS_154, topMvMoS_258, by = 'X')
+
+joined_fc <- as.data.frame(joined_fc)
+joined_fc$Sig <- "NS"
+joined_fc$Sig[(joined_fc[["adj.P.Val.y"]] > 0.05 ) & (joined_fc[["adj.P.Val.x"]] < 0.05 )] <- "Significant in published"
+joined_fc$Sig[(joined_fc[["adj.P.Val.y"]] < 0.05 ) & (joined_fc[["adj.P.Val.x"]] > 0.05 )] <- "Significant in unpublished"
+joined_fc$Sig[(joined_fc[["adj.P.Val.y"]] < 0.05 ) & (joined_fc[["adj.P.Val.x"]] < 0.05 )] <- "Significant in both"
+
+ggplot(joined_fc, mapping = aes(x = logFC.x, y = logFC.y, color = Sig)) + 
+  geom_point(alpha = 0.5) +
+  stat_cor(aes(x = logFC.x, y = logFC.y), label.x = 0) + 
+  geom_smooth(method='lm', color = '#5b388a') + 
+  geom_hline(yintercept = c(-1.5, 1.5), linetype = 'longdash', color = 'grey') +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = 'longdash', color = 'grey') +
+  labs(title = 'log2-Foldchanges in published and unpublished data', x = 'Log2 fold change in published data', y = 'Log2 fold change in unpublished data', subtitle = 'Mutagenic vs. Mock + Safe') + 
+  theme_pubclean() + scale_color_identity(guide = 'legend') + scale_colour_manual(name = 'Sig', values = c(NS = 'grey30', 'Significant in unpublished' = 'forestgreen', 'Significant in published' = 'royalblue', 'Significant in both' = 'red2')) + guides(shape = 1) + 
+  theme(legend.position = 'right')
+```
+
+
+### Report figure 2 - scRNA-seq
+```{r}
+### Main text:
+# Figure 2: scRNA-seq
+pData_258 <- read.csv('/home/mmallee/pData_258.csv')
+real_seurat <- readRDS('/exports/immu-staallab/Micah/real_seurat.rds')
+library(Seurat)
+CIBERSORT_RESULTS <- read.table('/exports/immu-staallab/Micah/Deconvolution_412_final/CIBERSORTx_Results.txt', sep = '\t', header = T)
+combined <- bind_cols(CIBERSORT_RESULTS, pData_412)
+ct_colors <- c("#66a453", "#6c81d9", "#5b388a", "#8fb03d", "#c99f3b", "#c169ba", "#45c097", "#b74873", "#ab7434", "#bb4c41")
+names(ct_colors) <- colnames(combined)[2:11]
+names(ct_colors)[c(6, 7)] <- c('Mast_cell/Basophil', 'DC/Macrophage')
+# A: UMAP of scRNA-seq data
+p2a <- DimPlot(real_seurat, group.by = 'cell_type', cols = ct_colors, raster = F, label = T, shuffle = T, repel = T) + 
+  theme_pubclean() + theme(legend.key = element_rect(fill = NA), legend.position = 'right') + ggtitle(label = 'Overview of cell types present in day 15 IVIM samples')
+
+# Annotation reasoning?
+annotation_features <- c('Fcer1a', 'Kit', 'Cma1', 'Tpsab1', 'Tpsb2', 'Car8', 'Hdc', 'Hgf', 'Perp', 'Cd38', 'Mmp19', 'Slc7a2', 'Mertk', 'Chil3', 'Stfa2', 'Stfa2l1', 'Chil1', 'Il1f9', 'Pf4', 'Gng11', 'Stmn1', 'Hist1h2ap', 'Top2a')
+
+p2b <- DotPlot(real_seurat, features = annotation_features, dot.min = 0, col.max = 2, scale.min = 0, scale.max = 2, group.by = 'cell_type', col.min = 0) + ggtitle(label = 'Marker gene expressions used for annotation') + ggpubr::theme_cleveland() + theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1), plot.title = element_text(face = 'plain'), plot.tag = element_text(face = 'plain')) + scale_color_gradient(low = 'lightgrey', high = '#5b388a')
+
+
+# Sample proportion for each cluster
+p2c <- barplot.seurat(obj = real_seurat, id1 = 'Sample', 'cell_type') + xlab('Sample') + ylab('Percentage of cells') + ggtitle('Cell type composition per sample') + scale_fill_manual(values = ct_colors) + theme_pubclean()
+
+
+# FACS differences
+facs_results <- readxl::read_excel(path = '~/Master_Database.xlsx', sheet = 2, na = 'NA', range = readxl::cell_cols("A:F"))
+facs_results_merged <-  plyr::join(pData_258, facs_results, by = 'Filename', type = 'inner')
+
+colnames(facs_results_merged)[17:19] <- c('Myeloid', 'Lineage negative', 'Mast (FCER1a+)')
+
+cell_types <- colnames(facs_results_merged)[17:19]
+ differences <- facs_results_merged %>%
+  group_by(Batch, Class) %>%
+  summarise_at(cell_types, median) %>% 
+  group_by(Batch) %>% 
+  summarise(-across(cell_types, diff))
+means_p_batch <- facs_results_merged %>% group_by(Batch) %>% summarise_at(cell_types, mean)
+  means_p_batch <- means_p_batch[!means_p_batch$Batch == 58,]
+ok <- melt(means_p_batch, id = c('Batch'))
+p2d <- ggplot(data = melt(differences, id = c('Batch')), aes(x=variable, y = value, col = ok$value)) + ggbeeswarm::geom_quasirandom(size = 4) + xlab('Cell type') + ggtitle('Difference in FACS sort proportion per batch') + theme_pubclean() + guides(col = guide_colourbar(title = "Mean cell proportion")) + scale_color_gradient(low = "lightgrey", high = '#5b388a') + geom_hline(yintercept = 0, linetype = 'longdash', color = 'darkgrey') + theme(axis.line.y = element_line(arrow = grid::arrow(ends = "both"), colour = 'darkgrey')) + annotate("text", x = c(0.9, 0.9), y = c(-0.3, 0.3), label = c("Higher in untransforming", 'Higher in transforming')) + ylab('Difference in mean cell proportion') + ylim(c(-0.4, 0.4))
+
+(p2a + p2b) / (p2c + p2d) + plot_annotation(tag_level = 'A')
+
+
+
+# Supplemental, regress out cell cycle
+real_seurat$CC.Difference <- real_seurat$S.Score - real_seurat$G2M.Score
+real_seurat_cc <- ScaleData(real_seurat, vars.to.regress = "CC.Difference", features = rownames(real_seurat))
+
+real_seurat_cc <- RunPCA(real_seurat_cc, npcs = 30, verbose = FALSE, features = rownames(real_seurat_cc))
+ElbowPlot(real_seurat_cc)
+real_seurat_cc <- RunUMAP(real_seurat_cc, reduction = "pca", dims = 1:10)
+
+DimPlot(real_seurat_cc, group.by = 'cell_type', label = T) + ggtitle('Cell cycle regressed', 'Colored based on original clusters') + scale_color_manual(values = ct_colors) + theme_pubclean()
+DimPlot(real_seurat, group.by = 'cell_type', label = T) + ggtitle('Cell cycle regressed') + scale_color_manual(values = ct_colors) + theme_pubclean()
+```
+
+
+### Report Figure 3 - Deconvolution results
+```{r}
+  # Overall deconvolution results
+  # p3a
+  names(ct_colors) <- colnames(combined)[2:11]
+  
+
+# FACS differences
+pData_258 <- read.csv('/home/mmallee/pData_258.csv')
+facs_results <- readxl::read_excel(path = '~/Master_Database.xlsx', sheet = 2, na = 'NA', range = readxl::cell_cols("A:F"))
+facs_results_merged <-  plyr::join(pData_258, facs_results, by = 'Filename', type = 'inner')
+
+
+  # differences in composition per batch
+  # ?: GGbeeswarm of difference in cell type percentage per batch, gradient by absolute numbers
+  cell_types <- colnames(combined)[2:11]
+   differences <- combined %>%
+    group_by(Batch, Class) %>%
+    summarise_at(cell_types, median) %>% 
+    group_by(Batch) %>% 
+    summarise(-across(cell_types, diff))
+  means_p_batch <- combined %>% group_by(Batch) %>% summarise_at(cell_types, mean)
+    
+  means_p_batch <- melt(means_p_batch, id = c('Batch'))
+  p3a <- ggplot(data = melt(differences, id = c('Batch')), aes(x=variable, y = value, col = means_p_batch$value)) + 
+    ggbeeswarm::geom_quasirandom() + 
+    xlab('Cell type') + 
+    ggtitle('Difference in estimated cell type proportion per batch') + 
+    theme_pubclean() + 
+    guides(col = guide_colourbar(title = "Mean cell proportion")) + 
+    scale_color_gradient(low = "lightgrey", high = '#5b388a') + 
+    geom_hline(yintercept = 0, linetype = 'longdash', color = 'darkgrey') + 
+    theme(axis.line.y = element_line(arrow = grid::arrow(ends = "both"), colour = 'darkgrey'), axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1), axis.ticks.y = element_blank()) + 
+    annotate("text", x = c(3.9, 3.9), y = c(-0.35, 0.35), label = c("Higher in untransforming", 'Higher in transforming')) + 
+    ylab('Difference in mean estimated cell proportion') + ylim(c(-0.4, 0.4))
+  
+  
+  # Correlation with flow
+  # facs_and_deconv <- merge(x = facs_results, y = combined_facs, by.x = 'Filename', by.y = 'Filename')
+  facs_and_deconv <-  plyr::join(combined, facs_results, by = 'Filename', type = 'inner')
+  colnames(facs_and_deconv)[31:33] <- c('Myeloid', 'Lineage_negative', 'FACS_Mast')
+  facs_and_deconv$Deconvolution_Mast <- facs_and_deconv$Basophil + facs_and_deconv$Mast_cell + facs_and_deconv$Mast_cell.Basophil + facs_and_deconv$HSPC
+
+p3b <- ggscatter(facs_and_deconv, x = "FACS_Mast", y = "Deconvolution_Mast", col= 'Batch', 
+            add = "reg.line", add.params = list(color = "#5b388a", fill = "lightgray"), conf.int = TRUE) + 
+  stat_cor(method = "pearson") + 
+  ggtitle(label = 'Estimated mast cell composition vs. FACS mast cell composition') + 
+  theme_pubclean() + 
+  theme(legend.key = element_rect(fill = NA)) + 
+  scale_color_manual(values = unname(ct_colors)[1:7]) + 
+  labs(x = 'FACS Mast (Fcer1a+) proportion', y = 'Estimated mast cell proportion') + 
+  lims(x = c(0, 1), y = c(0, 1)) + 
+  coord_fixed(ratio = 1)
+
+# SAGA prediction vs mast cell proportion
+supplemental_facs_corr <- ggscatter(facs_and_deconv, x = "FACS_Mast", y = "Deconvolution_Mast", col= 'Batch', 
+            add = "reg.line", add.params = list(color = "#5b388a", fill = "lightgray"), conf.int = TRUE) + 
+  stat_cor(method = "pearson") + 
+  ggtitle(label = 'Estimated mast cell composition vs. FACS mast cell composition') + 
+  theme_pubclean() + 
+  theme(legend.key = element_rect(fill = NA)) + 
+  scale_color_manual(values = unname(ct_colors)[1:7]) + 
+  labs(x = 'FACS Mast (Fcer1a+) proportion', y = 'Estimated mast cell proportion') + 
+  facet_wrap(~Batch) + 
+  lims(x = c(0, 1), y = c(0, 1))
+
+# Print final figure
+(p3a / p3b) + plot_annotation(tag_levels = 'A') + plot_layout(widths = 1)
+```
+
+### Report Figure 4 - Model testing
+```{r}
+# CV filtering
+library(pROC)
+ct_pseudo <- AggregateExpression(object = real_seurat, assays = 'RNA', return.seurat = T, group.by = 'cell_type')
+
+
+df <- data.frame(sd = apply(ct_pseudo@assays$RNA$counts, 1, sd), mean = apply(ct_pseudo@assays$RNA$counts, 1, mean))
+df$CV <- df$sd/df$mean
+df$CV[df$mean == 0] <- 0
+
+# First select genes based on total counts, to not have only genes with < 50 counts
+counts <- ct_pseudo@assays$RNA$counts
+
+df$counts <- apply(counts, 1, sum)
+
+p4a <- ggplot(df, aes(x=log2(counts))) + geom_density() + geom_vline(xintercept = log2(50), color = '#CB181D') + ggtitle('Counts density \n(log2 transformed)') + ggplot(df, aes(x=CV)) + geom_density() + geom_vline(xintercept = 2, color = '#CB181D') + ggtitle('Coefficient of variance')
+
+
+# Figure 5a RFE accuracies
+rfe.73 <- readRDS('/home/mmallee/SAGA_Model_5.0_Full_dataset/rfe.FINAL.rds')
+
+p4b <- ggplot(data = rfe.73[["results"]], aes(x = Variables, y = Accuracy)) + geom_line() + geom_point() + labs(title = 'RFE accuracy per feature subset', x = 'Number of variables retained', y = 'Accuracy (repeated cross validation)') + theme_pubclean() + geom_point(data = rfe.73[["results"]][48, ], aes(x = Variables, y = Accuracy), colour = "#CB181D", size = 2)
+
+
+# GA accuracies
+ga.73 <- readRDS('/home/mmallee/SAGA_Model_5.0_Full_dataset/gafinal.rds')
+
+performance.external.FINAL <- ga.73$external
+performance.external.FINAL <- arrange(performance.external.FINAL, Iter)
+performance.FINAL <- ga.73$ga$internal
+performance.FINAL$AccuracyExternal <- aggregate(performance.external.FINAL$Accuracy, by = list(Iter = performance.external.FINAL$Iter), mean)$x
+performance.long.FINAL <- data.frame(Iter = c(performance.FINAL$Iter, performance.FINAL$Iter), Accuracy = c(performance.FINAL$AccuracyExternal, performance.FINAL$Accuracy), Group = c(rep("external", 40), rep("internal", 40)))
+
+
+p4c <- ggplot(performance.long.FINAL, aes(Iter, Accuracy, col = Group)) +
+  geom_point() +
+  geom_smooth(span = 0.7, se = T) +
+  theme_pubclean() +
+  labs(title = 'Genetic algorithm internal and \nexternal accuracy', x = 'GA iteration', y = 'Accuracy')
+
+# # Confusion matrix
+Prediction_SVM.Caret <- read.csv('/home/mmallee/SAGA_Model_5.0_Full_dataset/SVM_test_73_predictions.csv')
+Prediction_SVM.Caret$Protocol[Prediction_SVM.Caret$Protocol %in% c('standard', 'standard (JF)')] <- 'Unpublished'
+Prediction_SVM.Caret$Protocol[Prediction_SVM.Caret$Protocol == 'published'] <- 'Published'
+cm <- confusionMatrix(data = as.factor(Prediction_SVM.Caret$Class), as.factor(Prediction_SVM.Caret$Prediction.SVM.Caret))
+plt <- as.data.frame(cm$table)
+plt$Prediction <- factor(plt$Prediction, levels=rev(levels(plt$Prediction)))
+
+p4d1 <- ggplot(plt, aes(Prediction,Reference, fill= Freq)) +
+  geom_tile() +
+  geom_text(aes(label=Freq)) +
+  scale_fill_gradient(low="white", high="#b2df8a") +
+  labs(x = "Reference",y = "Prediction") +
+  ggtitle('Confusion matrix', subtitle = paste('Total samples: ', nrow(Prediction_SVM.Caret))) +
+  theme_pubclean() +
+  theme(legend.position = 'none')
+
+# ROC 
+roc.73 <- roc(Prediction_SVM.Caret$Class, Prediction_SVM.Caret$transforming, percent = TRUE, 
+              levels=c("untransforming","transforming"), plot = T, auc.polygon = F, 
+              max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+              print.auc = T, print.thres = "best")
+data.labels <- coords(roc.73)
+
+roc.73$auc
+
+data.labels <- coords(roc.73, 'best', input = 'threshold', ret = c('threshold', 'specificity', 'sensitivity'))
+data.labels <- rbind(data.labels, coords(roc.73, 0.65, input = 'threshold', ret = c('threshold', 'specificity', 'sensitivity')))
+
+data.labels <- coords(roc.73, 0.65, input = 'threshold', ret = c('threshold', 'specificity', 'sensitivity'))
+
+
+p4d <- ggroc(roc.73) + 
+  theme(legend.position = 'none') + 
+  geom_text(data.labels, mapping = aes(0.5, 1, label = paste('AUC =', round(roc.73$auc, 2))), hjust = 1) + 
+  geom_text_repel(data.labels, mapping = aes(specificity, sensitivity, label = paste0(round(threshold, 2), ' (', round(specificity, 1), '%, ', round(sensitivity, 1),'%)')), min.segment.length = 0, position = position_nudge_repel(x = 30, y = -15)) + 
+  labs(title = 'ROC curve for SAGA-SVM \ntest set prediction', x = 'Specificity', y = 'Sensitivity') + theme_pubclean() + theme(legend.position = 'none')
+
+# Beeswarm of test set predictions
+p4e <- ggplot(Prediction_SVM.Caret, mapping = aes(x = Vector, y = transforming, color = Design)) + 
+  ggbeeswarm::geom_quasirandom() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + 
+  facet_wrap(~Protocol, scales = 'free') + 
+  ylim(c(0, 1)) + 
+  scale_color_manual(values = condition_colors) + 
+  theme_pubclean() + 
+  theme(legend.key = element_rect(fill = NA), axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + 
+  labs(title = 'Test set predictions', x = 'Vector type', y = 'Transforming prediction') + 
+  geom_hline(yintercept = 0.65, alpha = 0.5, linetype = 'dashed', color = '#CB181D')
+
+# Wrap plots
+p4a / (p4b | p4c | p4d) / patchwork::free(p4e) + plot_layout(heights = c(1, 1,2)) + plot_annotation(tag_levels = 'A')
+```
+
+### Report Figure 5 - Final model performance estimation
+```{r}
+# Also include genes
+rfe.final <- readRDS('/home/mmallee/SAGA_Model_5.0_Full_dataset/Final_412/rfe.FINAL.rds')
+gafinal <- readRDS('/home/mmallee/SAGA_Model_5.0_Full_dataset/Final_412/gafinal.rds')
+
+
+# 6A RFE accuracies
+p6a <- ggplot(data = rfe.final[["results"]], aes(x = Variables, y = Accuracy)) + geom_line() + geom_point() + labs(title = 'RFE accuracy per feature subset', x = 'Number of variables retained', y = 'Accuracy (repeated cross validation)') + theme_pubclean() + geom_point(data = rfe.final[["results"]][48, ], aes(x = Variables, y = Accuracy), colour = "#CB181D", size = 2)
+
+
+# GA accuracies
+performance.external.FINAL <- gafinal$external
+performance.external.FINAL <- arrange(performance.external.FINAL, Iter)
+performance.FINAL <- gafinal$ga$internal
+performance.FINAL$AccuracyExternal <- aggregate(performance.external.FINAL$Accuracy, by=list(Iter=performance.external.FINAL$Iter),mean)$x
+performance.long.FINAL <- data.frame(Iter = c(performance.FINAL$Iter,performance.FINAL$Iter), Accuracy = c(performance.FINAL$AccuracyExternal,performance.FINAL$Accuracy), Group=c(rep("external",40),rep("internal",40)))
+
+
+p6b <- ggplot(performance.long.FINAL, aes(Iter, Accuracy, col = Group)) +
+  geom_point() +
+  geom_smooth(span = 0.7, se = T) +
+  theme_pubclean() +
+  labs(title = 'Genetic algorithm internal and external accuracy', x = 'GA iteration', y = 'Accuracy')
+
+real_seurat <- readRDS('/exports/immu-staallab/Micah/real_seurat.rds')
+predictors_ann <- Annotation.known[gafinal$optVariables, ]
+library(Seurat)
+ct_colors <- c("#66a453", "#6c81d9", "#5b388a", "#8fb03d", "#c99f3b", "#c169ba", "#45c097", "#b74873", "#ab7434", "#bb4c41")
+CIBERSORT_RESULTS <- read.table('/exports/immu-staallab/Micah/Deconvolution_412_final/CIBERSORTx_Results.txt', sep = '\t', header = T)
+combined <- bind_cols(CIBERSORT_RESULTS, pData_412)
+names(ct_colors) <- colnames(combined)[2:11]
+names(ct_colors)[c(6, 7)] <- c('Mast_cell/Basophil', 'DC/Macrophage')
+real_seurat <- ScaleData(real_seurat, do.scale = T, do.center = T)
+p6c <- DoHeatmap(object = real_seurat, features = predictors_ann$GeneSymbol_FINAL, slot = 'scale.data', group.colors = ct_colors, angle = 90, label = F) + labs(title = 'Expression of predictors across scRNA-seq clusters', disp.min = -1, disp.max = 1)
+
+DotPlot(real_seurat, features = predictors_ann$GeneSymbol_FINAL, group.by = 'cell_type', assay = 'RNA')
+
+(p6a | p6b) / p6c + plot_layout(heights = c(1, 5)) + plot_annotation(tag_levels = 'A')
+
+# Write final predictors to text file
+f <- file("Predictors_74.txt")
+writeLines(predictors_ann$GeneSymbol_FINAL, f)
+close(f)
+```
+
+
+### Report Figure 6 - SAGA-GSEA
+```{r}
+# PCA of unbatchcorrected data
+pData_firstthree <- pData_412[pData_412$Batch %in% c(1, 2, 53), ]
+# Format as EListRaw
+E <- raw_agilent[, pData_firstthree$Sample_ID]
+E <- new("EListRaw", list(E = E, genes = data.frame(ProbeName = raw_agilent$ProbeID), targets = colnames(E), source = 'agilent.median'))
+eset.rma <- normalizeBetweenArrays(object = E, method = "quantile")
+eset.rma <- avereps(x = eset.rma, ID = E$genes$ProbeName) 
+eset.rma_m <- eset.rma$E
+eset.rma_m <- eset.rma_m[rownames(Annotation.known), ]
+
+library(ggforce)
+
+pca <- prcomp(t(eset.rma_m))
+pca_summary <- summary(pca)
+pca_df <- data.frame(x = pca$x[, 1], y = pca$x[, 2]) %>% bind_cols(., pData_firstthree)
+p6a <- ggplot(data = pca_df, aes_string("x", "y", col = "Design")) +
+  geom_point() +
+  ggpubr::theme_pubclean() + theme(legend.key = element_rect(fill = NA)) + 
+  labs(title = 'PCA plot of three batches', subtitle = 'Without batch correction', x = paste0("PC1 - Explained Variance (", round(pca_summary$importance[2, 1] * 100, 1), "%)"), y = paste0("PC2 - Explained Variance (", round(pca_summary$importance[2, 2] * 100, 1), "%)")) + 
+  scale_color_manual(values = condition_colors) + 
+  geom_mark_ellipse(aes(group = Batch, col = Batch, label = paste0('Batch: ', Batch)))
+
+
+
+
+
+
+# GSEA plot of predictors
+p6b1 <- plotEnrichment(pathway = SAGA.CORE$top67, stats = stats <- SAGA.GSEA$simulations$Group.2.fc$fc.hr) + labs(title = 'GSEA plot new predictors - Mutagenic vs Mock', subtitle = 'sample 7652', x = 'Rank', y = 'Enrichment Score (ES)')
+p6b2 <- plotEnrichment(pathway = SAGA.CORE$top67, stats = SAGA.GSEA$simulations$Group.4.fc$fc.hr) + labs(title = 'GSEA plot new predictors - Mock vs Safe', subtitle = 'sample 7654', x = 'Rank', y = 'Enrichment Score (ES)')
+p6b <- p6b1 / p6b2
+
+# ROC of predictions
+SIF <- read.csv('/home/mmallee/pData_train_412.csv', header = T)
+SIF$Protocol[SIF$Protocol %in% c('standard', 'standard (JF)')] <- 'Unpublished'
+SIF$Protocol[SIF$Protocol == 'published'] <- 'Published'
+batches <- levels(as.factor(SIF$Batch)) # how many assays / batches 
+batches <- batches[-which(batches == 11)]
+
+results_true <- lapply(batches, function(batch){
+  read.table(file = paste("~/SAGA_GSEA_results/Results_SAGA.GSEA_Batch_", batch,".txt", sep = ""), sep = "\t", header = T)
+})
+results_all <- data.table::rbindlist(results_true)
+
+results_top11 <- results_all[results_all$geneSet == 'top11',]
+results_top67 <- results_all[results_all$geneSet == 'top67',]
+
+Results_11 <- merge(SIF, results_top11, by.x = 0, by.y = "SampleID", all.x = F)
+Results_67 <- merge(SIF, results_top67, by.x = 0, by.y = "SampleID", all.x = F)
+rownames(Results_11) <- Results_11$Row.names
+rownames(Results_67) <- Results_67$Row.names
+
+
+rm(results_top11, results_top67, results_true, results_all)
+
+roc.11 <- roc(Results_11$Class,                    
+                  Results_11$nes,             
+                  percent = TRUE, levels=c("untransforming","transforming"),
+                  plot = F, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+                  print.auc = T, print.thres = "best")
+
+roc.67 <- roc(Results_67$Class,                    
+                  Results_67$nes,             
+                  percent = TRUE, levels=c("untransforming","transforming"),
+                  plot = F, auc.polygon = F, max.auc.polygon = F, col = "#686868", lwd = 4, grid = F, add = F,
+                  print.auc = T, print.thres = "best")
+
+roc.list <- list(roc.11, roc.67)
+
+# extract auc
+roc.list %>% 
+  map(~tibble(AUC = .x$auc)) %>% data.table::rbindlist() -> data.auc
+data.auc$name <- c('Original predictors (11)', 'Upregulated new predictors (67)')
+
+# generate labels labels
+data.labels <- cbind(data.auc, lapply(roc.list, coords, 'best', input = 'threshold', ret = c("threshold", 'specificity', 'sensitivity')) %>% data.table::rbindlist())
+
+names(roc.list) <- c('Original predictors (11)', 'Upregulated new predictors (67)')
+
+p6c <- ggroc(roc.list) + 
+  geom_text_repel(data.labels, mapping = aes(c(50, 25), y = 20, label = paste('AUC = ', round(AUC, 2))), hjust = 1) + 
+  geom_text_repel(data.labels, mapping = aes(specificity, sensitivity, 
+                                             label = paste0(round(threshold, 1), ' (', 
+                                                            round(specificity, 1), '%, ', 
+                                                            round(sensitivity, 1),'%)')), 
+                  nudge_y = c(15, -5), min.segment.length = 0, force = 3, nudge_x = c(5, 15)) + 
+  ggtitle('ROC curves for the original and new GSEA predictor set') + 
+  theme_pubclean() + 
+  geom_abline(intercept = c(100, 100), color = 'darkgray', linetype = 'dashed') +
+  scale_color_manual(values = c('Original predictors (11)' = '#bb4c41', 'Upregulated new predictors (67)' = '#5b388a'))
+
+# beeswarm of predictions
+p6d <- ggplot(Results_67[!Results_67$Protocol == 'standard (Clones)',], aes(x = Vector, y = nes, col = Design.x)) +
+  ggbeeswarm::geom_quasirandom() + 
+  scale_color_manual(values = condition_colors) + 
+  facet_wrap(~Protocol, scales = 'free_x') +
+  geom_hline(yintercept = 2, linetype = 'dashed') + 
+  theme_pubclean() + 
+  theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) + 
+  labs(title = 'SAGA-GSEA predictions', subtitle = 'Using new predictor set', y = 'Normalized Enrichment Score (NES)')
+
+# Print full figure:
+(p6a | p6b) / (p6c | p6d) + plot_annotation(tag_levels = 'A')
+
+```
+
+
+### Create test/train set
+```{r}
+test_batches <- c(3, 4, 16, 17, 32, 41, 47, 57, 59, 66, 71, 73)
+pData_test_73 <- pData_412[pData_412$Batch %in% test_batches,]
+table(pData_test_73$Design)
+# 39 mutagenic, 28 mock, 6 safe
+pData_train_339 <- pData_412[!pData_412$Batch %in% test_batches,]
+
+write.csv(pData_test_73, '/home/mmallee/pData_test_73.csv', row.names = F) # Done
+write.csv(pData_train_339, '/home/mmallee/pData_train_339.csv', row.names = F) # Done
+
+eset_339 <- get_BC_eset(droplevels(pData_train_339))
+# Write data
+write.table(eset_339, file = "/exports/immu-staallab/Micah/ESET_RMA_COMBAT_FullSagaSet339_FINAL.txt", sep = "\t", row.names = TRUE, col.names = NA)
+```
+
+
+
+
+
+### Cell surface predictors
+```{r}
+surface_protein_atlas <- readxl::read_excel("CPA.xlsx", sheet = "Table B")
+gafinal <- readRDS('/home/mmallee/SAGA_Model_5.0_Full_dataset/Final_412/gafinal.rds')
+
+predictors_ann <- Annotation.known[gafinal$optVariables, ]
+hits <- merge(y = surface_protein_atlas, x = predictors_ann, by.y = 'ENTREZ gene symbol', by.x = 'GeneSymbol_FINAL')
+
+predictors_ann <- cbind(ProbeID = rownames(predictors_ann), predictors_ann)
+
+writexl::write_xlsx(list(predictors_ann, hits), 'Supplemental_table_S7_Final_74_predictors.xlsx')
+```
+
+
+### Report figures
+```{r}
+# Piechart samples
+data <- pData_412
+data <- data %>% 
+  group_by(Design) %>% 
+  count() %>% 
+  ungroup() %>% 
+  mutate(per=`n`/sum(`n`)) %>% 
+  arrange(desc(Design))
+data$label <- scales::percent(data$per)
+
+ggplot(data=data)+
+  geom_bar(aes(x = "", y = per, fill = Design), stat="identity", width = 1) +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  geom_text(aes(x = 1, y = cumsum(per) - per/2, label = label)) + 
+  scale_fill_manual(values = condition_colors)
+
+
+ggplot(pData_412, aes(x="", fill = Design, y = Design)) + geom_bar(stat = 'identity', width = 1) + coord_polar('y', start = 0) + geom_text(aes(label = Design))
+
+
+df <- cbind(ProbeID = rownames(Annotation.known), Annotation.known)
+
+writexl::write_xlsx(df, 'Supplemental_Table_S1_Probe_Annotation.xlsx')
+
+
+
+pData_412
+pData_test_73 <- read.csv('/home/mmallee/pData_test_73.csv')
+pData_train_339 <- read.csv('/home/mmallee/pData_train_339.csv')
+writexl::write_xlsx(list(pData_412, pData_test_73, pData_train_339), 'Supplemental_Table_S4_Test_train_split.xlsx')
+
+
+unknown_markers <- FindMarkers(real_seurat, ident.1 = 'Unknown', only.pos = T, min.diff.pct = 0.3)
+unknown_markers <- cbind(Gene = rownames(unknown_markers), unknown_markers)
+
+writexl::write_xlsx(unknown_markers, 'Supplemental_Table_S5_Unknown_DEG.xlsx')
+
+gafinal <- readRDS('/home/mmallee/SAGA_Model_5.0_Full_dataset/Final_412/gafinal.rds')
+predictors_ann <- Annotation.known[gafinal$optVariables, ]
+```
+
